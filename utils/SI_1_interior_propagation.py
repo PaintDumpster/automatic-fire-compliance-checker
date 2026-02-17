@@ -96,6 +96,82 @@ def _to_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+#2.Special Risk Rooms (Locales de riesgo especial)
+import re
+from typing import Dict, Any, List, Optional, Tuple
+
+# Map: detected_type -> keywords (spanish + english + some common variants)
+RISK_KEYWORDS = {
+    "electrical_room": [
+        "cuarto electrico", "cuarto eléctrico", "sala electrica", "sala eléctrica",
+        "electric", "electrical", "elec", "switchgear", "panel", "mv", "lv"
+    ],
+    "boiler_room": [
+        "caldera", "sala de calderas", "boiler", "plant room", "mechanical room"
+    ],
+    "laundry": [
+        "lavanderia", "lavandería", "laundry"
+    ],
+    "storage": [
+        "almacen", "almacén", "trastero", "storage", "store", "deposito", "depósito"
+    ],
+    "kitchen": [
+        "cocina", "kitchen"
+    ],
+    "waste_room": [
+        "basura", "residuos", "waste", "garbage", "trash"
+    ],
+    "garage": [
+        "garaje", "garage", "parking", "aparcamiento"
+    ]
+}
+
+def _norm(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+def _collect_space_text(space: Dict[str, Any]) -> str:
+    """Combine name/object_type/long_name/zones into one searchable text."""
+    parts = [
+        _norm(space.get("name")),
+        _norm(space.get("long_name")),
+        _norm(space.get("object_type")),
+    ]
+    zones = space.get("zones") or []
+    parts.extend([_norm(z) for z in zones])
+    return " | ".join([p for p in parts if p])
+
+def detect_risk_room_type(space: Dict[str, Any]) -> Tuple[Optional[str], float, List[str]]:
+    """
+    Returns:
+      (detected_type, confidence, matched_keywords)
+    """
+    text = _collect_space_text(space)
+    if not text:
+        return None, 0.0, []
+
+    best_type = None
+    best_score = 0.0
+    best_matches: List[str] = []
+
+    for room_type, keywords in RISK_KEYWORDS.items():
+        matches = []
+        for kw in keywords:
+            if kw in text:
+                matches.append(kw)
+
+        if matches:
+            # simple confidence: more keyword hits => higher confidence
+            score = min(1.0, 0.3 + 0.2 * len(matches))
+            if score > best_score:
+                best_score = score
+                best_type = room_type
+                best_matches = matches
+
+    return best_type, best_score, best_matches
+risk_result = check_special_risk_rooms(scan["spaces"])
+
+print(json.dumps(risk_result, indent=2))
+
 
 # ============================================================
 # SECTION B — STOREY LOOKUP (FAST)

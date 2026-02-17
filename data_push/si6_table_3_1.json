@@ -1,0 +1,61 @@
+{
+    "_metadata": {
+        "source": "DB SI - Documento Básico Seguridad en caso de Incendio",
+        "section": "SI 6 — Structural Fire Resistance",
+        "table": "Table 3.1 — Sufficient fire resistance of structural elements (minutes)",
+        "regulation": "Spain Technical Building Code (CTE)",
+        "updated": "4 March 2025 (Royal Decree 164/2025)",
+        "notes": {
+            "h_le_15": "Evacuation height 15m or below",
+            "h_le_28": "Evacuation height between 15m and 28m",
+            "h_gt_28": "Evacuation height above 28m",
+            "basement": "Below-ground floors",
+            "all": "Same requirement regardless of height"
+        }
+    },
+    "residential": {
+        "basement": 120,
+        "h_le_15": 60,
+        "h_le_28": 90,
+        "h_gt_28": 120
+    },
+    "educational": {
+        "basement": 120,
+        "h_le_15": 60,
+        "h_le_28": 90,
+        "h_gt_28": 120
+    },
+    "administrative": {
+        "basement": 120,
+        "h_le_15": 60,
+        "h_le_28": 90,
+        "h_gt_28": 120
+    },
+    "commercial": {
+        "basement": 120,
+        "h_le_15": 90,
+        "h_le_28": 120,
+        "h_gt_28": 180
+    },
+    "healthcare": {
+        "basement": 120,
+        "h_le_15": 90,
+        "h_le_28": 120,
+        "h_gt_28": 180
+    },
+    "public_assembly": {
+        "basement": 120,
+        "h_le_15": 90,
+        "h_le_28": 120,
+        "h_gt_28": 180
+    },
+    "car_park_standalone": {
+        "all": 90
+    },
+    "car_park_below_other": {
+        "all": 120
+    },
+    "single_family": {
+        "all": 30
+    }
+}

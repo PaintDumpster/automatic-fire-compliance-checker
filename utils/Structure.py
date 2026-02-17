@@ -1,6 +1,8 @@
 # ─────────────────────────────────────────────
 # IMPORTED LIBRARIES
 # ─────────────────────────────────────────────
+import json
+import os
 import ifcopenshell
 
 
@@ -8,54 +10,17 @@ import ifcopenshell
 # FUNCTION
 # ─────────────────────────────────────────────
 
-# SI 6 Table 3.1 — Required fire resistance (minutes)
-# { building_use: { height_band: required_R } }
+# Load SI 6 Table 3.1 from external JSON file
+# The JSON file should be in the same directory as this script
+_JSON_PATH = r"D:\IAAC\AI IN ARCHITECTURE\Fireiguanas\automatic-fire-compliance-checker\data_push\si6_table_3_1.json"
+
+with open(_JSON_PATH, "r") as f:
+    _SI6_DATA = json.load(f)
+
 SI6_TABLE_3_1 = {
-    "residential": {
-        "basement": 120,
-        "h_le_15":  60,
-        "h_le_28":  90,
-        "h_gt_28":  120
-    },
-    "educational": {
-        "basement": 120,
-        "h_le_15":  60,
-        "h_le_28":  90,
-        "h_gt_28":  120
-    },
-    "administrative": {
-        "basement": 120,
-        "h_le_15":  60,
-        "h_le_28":  90,
-        "h_gt_28":  120
-    },
-    "commercial": {
-        "basement": 120,
-        "h_le_15":  90,
-        "h_le_28":  120,
-        "h_gt_28":  180
-    },
-    "healthcare": {
-        "basement": 120,
-        "h_le_15":  90,
-        "h_le_28":  120,
-        "h_gt_28":  180
-    },
-    "public_assembly": {
-        "basement": 120,
-        "h_le_15":  90,
-        "h_le_28":  120,
-        "h_gt_28":  180
-    },
-    "car_park_standalone": {
-        "all": 90
-    },
-    "car_park_below_other": {
-        "all": 120
-    },
-    "single_family": {
-        "all": 30
-    }
+    key: value
+    for key, value in _SI6_DATA.items()
+    if not key.startswith("_")        # skip metadata keys
 }
 
 
@@ -128,7 +93,8 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
     # Determine the required R rating from SI 6 Table 3.1
     required_R = get_required_R(building_use, evacuation_height_m, is_basement)
     if required_R is None:
-        return {"error": f"Unrecognised building use: '{building_use}'"}
+        return {"error": f"Unrecognised building use: '{building_use}'. "
+                         f"Valid options: {list(SI6_TABLE_3_1.keys())}"}
 
     # Primary structural element types per SI 6 Section 3
     element_types = [
@@ -151,15 +117,15 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
     # Loop through every structural element and check its fire rating
     for ifc_type in element_types:
         for element in model.by_type(ifc_type):
-            name      = element.Name or element.GlobalId
-            actual_R  = get_fire_rating(element)
+            name     = element.Name or element.GlobalId
+            actual_R = get_fire_rating(element)
 
             entry = {
-                "id":          element.GlobalId,
-                "name":        name,
-                "type":        ifc_type,
-                "required_R":  required_R,
-                "actual_R":    actual_R
+                "id":         element.GlobalId,
+                "name":       name,
+                "type":       ifc_type,
+                "required_R": required_R,
+                "actual_R":   actual_R
             }
 
             if actual_R is None:

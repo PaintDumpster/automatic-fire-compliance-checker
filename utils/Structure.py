@@ -12,7 +12,7 @@ import ifcopenshell
 
 # Load SI 6 Table 3.1 from external JSON file
 # The JSON file should be in the same directory as this script
-_JSON_PATH = r"D:\IAAC\AI IN ARCHITECTURE\Fireiguanas\automatic-fire-compliance-checker\data_push\si6_table_3_1.json"
+_JSON_PATH = "data_push/si6_table_3_1.json"
 
 with open(_JSON_PATH, "r") as f:
     _SI6_DATA = json.load(f)
@@ -156,7 +156,7 @@ if __name__ == "__main__":
 
     # --- Test 1: Residential building, 20m evacuation height ---
     report = check_si6_compliance(
-        ifc_path            = "my_building.ifc",
+        ifc_path            = "00_data/ifc_models/01_Duplex_Apartment.ifc",
         building_use        = "residential",
         evacuation_height_m = 20
     )
@@ -182,27 +182,4 @@ if __name__ == "__main__":
         for el in report["no_data"]:
             print(f"  [{el['type']}] {el['name']} — {el['issue']}")
 
-    # --- Test 2: Commercial building, 30m evacuation height ---
-    report2 = check_si6_compliance(
-        ifc_path            = "my_building.ifc",
-        building_use        = "commercial",
-        evacuation_height_m = 30
-    )
-
-    print("\n" + "=" * 50)
-    print("TEST 2 — Commercial, 30m")
-    print("=" * 50)
-    print(f"Required R rating  : R{report2['required_R']}")
-    print(f"Overall compliant  : {report2['overall_compliant']}")
-
-    # --- Test 3: Unknown building use ---
-    report3 = check_si6_compliance(
-        ifc_path            = "my_building.ifc",
-        building_use        = "warehouse",
-        evacuation_height_m = 10
-    )
-
-    print("\n" + "=" * 50)
-    print("TEST 3 — Unknown use (expect error)")
-    print("=" * 50)
-    print(report3)
+    

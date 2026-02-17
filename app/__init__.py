@@ -1,0 +1,3 @@
+"""
+Fire Compliance Checker Application
+"""

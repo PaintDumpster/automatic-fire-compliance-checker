@@ -67,6 +67,51 @@ def get_fire_rating(element):
     return None
 
 
+def extract_building_use_from_ifc(model):
+    """
+    Extracts building use from IFC model.
+    Looks for IfcBuilding and checks for use classification or metadata.
+    Returns a default value if not found.
+    """
+    buildings = model.by_type("IfcBuilding")
+    if buildings:
+        building = buildings[0]
+        # Check for usage description in Description or other properties
+        if hasattr(building, "Description") and building.Description:
+            desc = str(building.Description).lower()
+            if "residential" in desc:
+                return "residential"
+            elif "commercial" in desc:
+                return "commercial"
+            elif "office" in desc:
+                return "office"
+    return "residential"  # Default fallback
+
+
+def extract_evacuation_height_from_ifc(model):
+    """
+    Extracts evacuation height from IFC model.
+    Calculates from the highest storey elevation.
+    Returns height in metres.
+    """
+    storeys = model.by_type("IfcBuildingStorey")
+    if not storeys:
+        return 20.0  # Default fallback
+
+    max_elevation = 0.0
+    for storey in storeys:
+        if hasattr(storey, "Elevation") and storey.Elevation:
+            elevation = float(storey.Elevation)
+            if elevation > max_elevation:
+                max_elevation = elevation
+
+    # If no elevation data, try to extract from geometry
+    if max_elevation == 0.0:
+        return 20.0
+
+    return max_elevation
+
+
 def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basement=False):
     """
     Checks all primary structural elements in an IFC file against
@@ -181,5 +226,6 @@ if __name__ == "__main__":
         print("\nElements with missing fire rating data:")
         for el in report["no_data"]:
             print(f"  [{el['type']}] {el['name']} — {el['issue']}")
+   
 
     

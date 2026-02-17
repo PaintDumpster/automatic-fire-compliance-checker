@@ -290,4 +290,4 @@ if __name__ == "__main__":
         for elem_type, count in material_missing.items():
             print(f"  {elem_type}: {count} elements without FireRating property")
     
-    print("\n" + "=" * 71)
+    print("\n" + "=" * 70)

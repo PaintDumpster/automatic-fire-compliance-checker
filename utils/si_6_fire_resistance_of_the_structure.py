@@ -375,6 +375,103 @@ def extract_evacuation_height_from_ifc(model):
     return max_elevation
 
 
+# ─────────────────────────────────────────────
+# IFCore-Compliant Check Function
+# ─────────────────────────────────────────────
+
+def check_fire_rating(model, building_use=None, evacuation_height_m=None, is_basement=False):
+    """
+    IFCore-compliant check function: Validates SI 6 fire resistance requirements.
+    
+    Signature complies with IFCore platform contracts:
+    - First argument: model (ifcopenshell.file object, pre-loaded)
+    - Returns: list[dict] matching element_results schema
+    - Each dict represents one element checked
+    
+    Auto-detects building_use and evacuation_height_m from IFC if not provided.
+    
+    Parameters:
+        model (ifcopenshell.file) - Pre-loaded IFC model object
+        building_use (str, optional) - e.g. 'residential', 'commercial'. If None, auto-detected.
+        evacuation_height_m (float, optional) - Building height in metres. If None, auto-detected.
+        is_basement (bool) - True if checking basement floor
+    
+    Returns:
+        list[dict] - Each dict has fields:
+            element_id, element_type, element_name, element_name_long,
+            check_status ("pass"|"fail"|"warning"|"blocked"|"log"),
+            actual_value, required_value, comment, log
+    """
+    
+    # Auto-detect if not provided
+    if building_use is None:
+        building_use = extract_building_use_from_ifc(model)
+    if evacuation_height_m is None:
+        evacuation_height_m = extract_evacuation_height_from_ifc(model)
+    
+    # Determine required R rating from SI 6 Table 3.1
+    required_R = get_required_R(building_use, evacuation_height_m, is_basement)
+    if required_R is None:
+        logger.warning("Could not determine required_R for building_use=%s", building_use)
+        required_R = 60  # Fallback default
+    
+    # Primary structural element types per SI 6 Section 3
+    element_types = [
+        "IfcBeam",
+        "IfcColumn",
+        "IfcSlab",
+        "IfcMember",
+        "IfcWall",
+        "IfcFooting",
+        "IfcRoof",
+        "IfcStair",
+        "IfcStairFlight",
+        "IfcRailing",
+    ]
+    
+    results = []
+    
+    # Loop through every structural element and check its fire rating
+    for ifc_type in element_types:
+        for element in model.by_type(ifc_type):
+            element_id = element.GlobalId
+            element_name = element.Name or f"{ifc_type}#{element.id()}"
+            actual_R = get_fire_rating(element, building_use, element_type=ifc_type)
+            
+            # Determine check status
+            if actual_R is None:
+                check_status = "blocked"
+                actual_value = None
+                comment = "Fire rating property missing"
+            elif actual_R >= required_R:
+                check_status = "pass"
+                actual_value = f"R{actual_R}"
+                comment = None
+            else:
+                check_status = "fail"
+                actual_value = f"R{actual_R}"
+                deficit = required_R - actual_R
+                comment = f"Deficit: {deficit} minutes (has R{actual_R}, needs R{required_R})"
+            
+            results.append({
+                "element_id": element_id,
+                "element_type": ifc_type,
+                "element_name": element_name,
+                "element_name_long": element_name,
+                "check_status": check_status,
+                "actual_value": actual_value,
+                "required_value": f"R{required_R}",
+                "comment": comment,
+                "log": None,
+            })
+    
+    return results
+
+
+# ─────────────────────────────────────────────
+# Legacy Functions (Backward Compatibility)
+# ─────────────────────────────────────────────
+
 def get_si6_compliance_details(ifc_path, building_use, evacuation_height_m, is_basement=False):
     """
     Checks all primary structural elements in an IFC file against

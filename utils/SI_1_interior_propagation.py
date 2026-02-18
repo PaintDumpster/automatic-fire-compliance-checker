@@ -297,12 +297,39 @@ def check_special_risk_rooms(spaces: List[Dict[str, Any]], rules: Dict[str, Any]
     any_missing_area_or_volume = False
     any_high_risk = False
 
+    # Precompute normalized keyword set for debug purposes (long_name hits)
+    all_keyword_norms: List[str] = []
+    for kw_cfg in keywords_cfg.values():
+        if isinstance(kw_cfg, dict):
+            kw_list = kw_cfg.get("keywords", [])
+        else:
+            kw_list = kw_cfg
+        for kw in kw_list or []:
+            kw_norm = (str(kw) or "").strip().lower()
+            if kw_norm and kw_norm not in all_keyword_norms:
+                all_keyword_norms.append(kw_norm)
+
+    debug_long_name_hits = 0
+
+    # Debug: print basic keyword config information
+    try:
+        print(f"[SI1][special_risk] keyword groups: {len(keywords_cfg)}")
+        kitchen_cfg = keywords_cfg.get("kitchen")
+        if isinstance(kitchen_cfg, dict):
+            kitchen_kw_list = kitchen_cfg.get("keywords", []) or []
+        else:
+            kitchen_kw_list = kitchen_cfg or []
+        print(f"[SI1][special_risk] kitchen sample keywords: {kitchen_kw_list[:3]}")
+    except Exception:
+        pass
+
     for sp in spaces:
         # Collect searchable text
         name = sp.get("name") or ""
         long_name = sp.get("long_name") or ""
         object_type = sp.get("object_type") or ""
         zones = sp.get("zones") or []
+        description = sp.get("description") or ""
 
         parts = [
             _norm_text(name),
@@ -310,9 +337,22 @@ def check_special_risk_rooms(spaces: List[Dict[str, Any]], rules: Dict[str, Any]
             _norm_text(object_type),
         ]
         parts.extend(_norm_text(z) for z in zones if z)
+        parts.append(_norm_text(description))
         text = " | ".join(p for p in parts if p)
         if not text:
             continue
+
+        # Debug: long_name contains any risk keyword?
+        ln_norm = _norm_text(long_name)
+        if ln_norm and any(kw in ln_norm for kw in all_keyword_norms):
+            debug_long_name_hits += 1
+
+        # Debug: print searchable text for specific test spaces (e.g. A103, B103)
+        try:
+            if name in ("A103", "B103"):
+                print(f"[SI1][special_risk] space {name} searchable text: {text}")
+        except Exception:
+            pass
 
         detected_type: Optional[str] = None
         matched_keywords: List[str] = []
@@ -422,6 +462,7 @@ def check_special_risk_rooms(spaces: List[Dict[str, Any]], rules: Dict[str, Any]
         "details": {
             "detected_count": detected_count,
             "items": items,
+            "debug_long_name_keyword_hit_count": debug_long_name_hits,
         },
     }
 # ---------- core ----------
@@ -445,6 +486,9 @@ def scan_one_ifc(ifc_path: str, exclude_space_predicate: Optional[Callable[[Dict
         space_rows.append({
             "guid": safe_attr(sp, "GlobalId"),
             "name": safe_attr(sp, "Name") or "Unnamed",
+            "long_name": safe_attr(sp, "LongName"),
+            "object_type": safe_attr(sp, "ObjectType"),
+            "description": safe_attr(sp, "Description"),
             "storey": storey_map.get(sp.id()),
             "area_m2": area,
             "area_method": area_method,

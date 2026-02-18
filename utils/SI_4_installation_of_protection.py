@@ -3,29 +3,33 @@ SI-4 (Instalaciones de protección contra incendios) checker for IFC models.
 
 Focused scope:
 - Building use: Administrativo.
-- Rules extracted from `utils/regulation.txt` (Tabla 1.1, SI 4).
+- Rules and thresholds loaded from `data_push/SI_4_table.json`.
 
 Usage:
-	python utils/SI_4_installation_of_protection.py --ifc <path_to_file.ifc>
-	python utils/SI_4_installation_of_protection.py --ifc <path_to_file.ifc> --json-out report.json
+	1) Set `ifc_input_path` in `data_push/SI_4_table.json`.
+	2) Run: `python utils/SI_4_installation_of_protection.py`
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import ifcopenshell
 
 
 ADMIN_BUILDING_USE = "Administrativo"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "data_push" / "SI_4_table.json"
+DEFAULT_IFC_INPUT_PATH = ""
+DEFAULT_JSON_OUT_PATH: Optional[str] = None
+PRINT_FULL_REPORT = False
 
 
 def _to_float(value: Any) -> Optional[float]:
+	"""Convert a value to float and return None when conversion fails."""
 	try:
 		if value is None:
 			return None
@@ -35,12 +39,14 @@ def _to_float(value: Any) -> Optional[float]:
 
 
 def _norm(text: Any) -> str:
+	"""Normalize values to lowercase stripped strings for robust text matching."""
 	if text is None:
 		return ""
 	return str(text).strip().lower()
 
 
 def _safe_get_psets(element: ifcopenshell.entity_instance) -> Dict[str, Dict[str, Any]]:
+	"""Safely read IFC property sets from an element."""
 	try:
 		from ifcopenshell.util.element import get_psets  # type: ignore
 
@@ -53,6 +59,8 @@ def _safe_get_psets(element: ifcopenshell.entity_instance) -> Dict[str, Dict[str
 
 
 def _entity_text_blob(element: ifcopenshell.entity_instance) -> str:
+	"""Build a searchable text blob from IFC attributes and property set data."""
+
 	parts = [
 		_norm(getattr(element, "Name", None)),
 		_norm(getattr(element, "Description", None)),
@@ -72,7 +80,24 @@ def _entity_text_blob(element: ifcopenshell.entity_instance) -> str:
 	return " | ".join([p for p in parts if p])
 
 
+def _load_si4_table_config() -> Dict[str, Any]:
+	"""Load SI-4 parameters from JSON and validate minimum required sections."""
+	if not CONFIG_PATH.exists():
+		raise FileNotFoundError(f"Missing configuration file: {CONFIG_PATH}")
+
+	data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+	if not isinstance(data, dict):
+		raise ValueError("SI-4 configuration must be a JSON object.")
+
+	for key in ("scan_definitions", "rules", "actions_by_rule"):
+		if key not in data:
+			raise ValueError(f"Missing required key in SI-4 config: {key}")
+
+	return data
+
+
 def _get_element_quantities(element: ifcopenshell.entity_instance) -> Dict[str, float]:
+	"""Extract numeric quantities from IfcElementQuantity relations."""
 	quantities: Dict[str, float] = {}
 	try:
 		for rel in getattr(element, "IsDefinedBy", []) or []:
@@ -102,24 +127,20 @@ def _get_element_quantities(element: ifcopenshell.entity_instance) -> Dict[str, 
 	return quantities
 
 
-def _get_space_area_m2(space: ifcopenshell.entity_instance) -> Optional[float]:
+def _get_space_area_m2(space: ifcopenshell.entity_instance, config: Dict[str, Any]) -> Optional[float]:
+	"""Resolve space area using configured quantity keys and configured pset fallbacks."""
 	q = _get_element_quantities(space)
-	for key in (
-		"netfloorarea",
-		"grossfloorarea",
-		"area",
-		"net area",
-		"gross area",
-		"floorarea",
-		"floor area",
-	):
-		if key in q:
-			return q[key]
+	for key in config.get("space_area_quantity_keys", []):
+		norm_key = _norm(key)
+		if norm_key in q:
+			return q[norm_key]
 
 	psets = _safe_get_psets(space)
-	base_qto = psets.get("Qto_SpaceBaseQuantities", {})
+	pset_cfg = config.get("space_area_pset", {}) if isinstance(config.get("space_area_pset"), dict) else {}
+	pset_name = pset_cfg.get("name", "Qto_SpaceBaseQuantities")
+	base_qto = psets.get(pset_name, {})
 	if isinstance(base_qto, dict):
-		for k in ("NetFloorArea", "GrossFloorArea"):
+		for k in pset_cfg.get("keys", ["NetFloorArea", "GrossFloorArea"]):
 			v = _to_float(base_qto.get(k))
 			if v is not None:
 				return v
@@ -127,14 +148,15 @@ def _get_space_area_m2(space: ifcopenshell.entity_instance) -> Optional[float]:
 	return None
 
 
-def _calc_total_constructed_area_m2(ifc_file: ifcopenshell.file) -> Optional[float]:
+def _calc_total_constructed_area_m2(ifc_file: ifcopenshell.file, config: Dict[str, Any]) -> Optional[float]:
+	"""Compute total built area as the sum of all valid `IfcSpace` areas."""
 	spaces = ifc_file.by_type("IfcSpace") or []
 	if not spaces:
 		return None
 
 	values: List[float] = []
 	for space in spaces:
-		a = _get_space_area_m2(space)
+		a = _get_space_area_m2(space, config)
 		if a is not None and a > 0:
 			values.append(a)
 
@@ -144,6 +166,7 @@ def _calc_total_constructed_area_m2(ifc_file: ifcopenshell.file) -> Optional[flo
 
 
 def _calc_evacuation_heights_m(ifc_file: ifcopenshell.file) -> Tuple[Optional[float], Optional[float], int]:
+	"""Compute descending/ascending evacuation heights from storey elevations."""
 	storeys = ifc_file.by_type("IfcBuildingStorey") or []
 	if not storeys:
 		return None, None, 0
@@ -167,13 +190,19 @@ def _count_ifc_elements_by_keywords(
 	entity_types: Sequence[str],
 	keywords: Sequence[str],
 ) -> Tuple[int, List[str], List[Dict[str, Any]]]:
+	"""Count IFC elements matching any keyword and collect evidence snippets/items."""
 	compiled = [re.compile(re.escape(k), re.IGNORECASE) for k in keywords]
 	count = 0
 	examples: List[str] = []
 	items: List[Dict[str, Any]] = []
 
 	for entity_type in entity_types:
-		for element in ifc_file.by_type(entity_type) or []:
+		try:
+			elements = ifc_file.by_type(entity_type) or []
+		except Exception:
+			continue
+
+		for element in elements:
 			blob = _entity_text_blob(element)
 			if not blob:
 				continue
@@ -196,96 +225,32 @@ def _count_ifc_elements_by_keywords(
 	return count, examples, items
 
 
-def _scan_installations(ifc_file: ifcopenshell.file) -> Dict[str, Dict[str, Any]]:
+def _scan_installations(ifc_file: ifcopenshell.file, config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+	"""Scan IFC elements using keyword/entity parameters defined in JSON config."""
 	scans: Dict[str, Dict[str, Any]] = {}
+	scan_definitions = config.get("scan_definitions", {})
+	if not isinstance(scan_definitions, dict):
+		return scans
 
-	extinguisher_count, extinguisher_examples, extinguisher_items = _count_ifc_elements_by_keywords(
-		ifc_file,
-		entity_types=["IfcFireSuppressionTerminal", "IfcFlowTerminal", "IfcProxy"],
-		keywords=["extintor", "extinguisher", "21a", "113b"],
-	)
-	scans["portable_extinguishers"] = {
-		"count": extinguisher_count,
-		"examples": extinguisher_examples,
-		"items": extinguisher_items,
-	}
+	for check_key, definition in scan_definitions.items():
+		if not isinstance(definition, dict):
+			continue
 
-	bie_count, bie_examples, bie_items = _count_ifc_elements_by_keywords(
-		ifc_file,
-		entity_types=["IfcFireSuppressionTerminal", "IfcFlowTerminal", "IfcProxy"],
-		keywords=["bie", "boca de incendio", "hose reel", "fire hose cabinet"],
-	)
-	scans["fire_hose_cabinets_bie"] = {
-		"count": bie_count,
-		"examples": bie_examples,
-		"items": bie_items,
-	}
+		entity_types = definition.get("entity_types", [])
+		keywords = definition.get("keywords", [])
+		if not isinstance(entity_types, list) or not isinstance(keywords, list):
+			continue
 
-	dry_riser_count, dry_riser_examples, dry_riser_items = _count_ifc_elements_by_keywords(
-		ifc_file,
-		entity_types=["IfcDistributionSystem", "IfcPipeSegment", "IfcPipeFitting", "IfcProxy"],
-		keywords=["columna seca", "dry riser"],
-	)
-	scans["dry_riser"] = {
-		"count": dry_riser_count,
-		"examples": dry_riser_examples,
-		"items": dry_riser_items,
-	}
-
-	alarm_count_1, alarm_examples_1, alarm_items = _count_ifc_elements_by_keywords(
-		ifc_file,
-		entity_types=["IfcAlarm", "IfcSensor", "IfcAlarmType", "IfcProxy"],
-		keywords=["alarm", "alarma", "manual call point", "pulsador"],
-	)
-	scans["alarm_system"] = {
-		"count": alarm_count_1,
-		"examples": alarm_examples_1,
-		"items": alarm_items,
-	}
-
-	detector_count, detector_examples, detector_items = _count_ifc_elements_by_keywords(
-		ifc_file,
-		entity_types=["IfcSensor", "IfcAlarm", "IfcProxy"],
-		keywords=["detector", "smoke detector", "heat detector", "detector de incend"],
-	)
-	scans["fire_detection"] = {
-		"count": detector_count,
-		"examples": detector_examples,
-		"items": detector_items,
-	}
-
-	hydrant_count, hydrant_examples, hydrant_items = _count_ifc_elements_by_keywords(
-		ifc_file,
-		entity_types=["IfcFireSuppressionTerminal", "IfcFlowTerminal", "IfcProxy"],
-		keywords=["hidrante", "hydrant"],
-	)
-	scans["external_hydrants"] = {
-		"count": hydrant_count,
-		"examples": hydrant_examples,
-		"items": hydrant_items,
-	}
-
-	sprinkler_count, sprinkler_examples, sprinkler_items = _count_ifc_elements_by_keywords(
-		ifc_file,
-		entity_types=["IfcSprinkler", "IfcFireSuppressionTerminal", "IfcProxy"],
-		keywords=["sprinkler", "rociador", "extincion automatica", "extinción automática"],
-	)
-	scans["automatic_extinguishing"] = {
-		"count": sprinkler_count,
-		"examples": sprinkler_examples,
-		"items": sprinkler_items,
-	}
-
-	emergency_lift_count, emergency_lift_examples, emergency_lift_items = _count_ifc_elements_by_keywords(
-		ifc_file,
-		entity_types=["IfcTransportElement", "IfcElevator", "IfcProxy"],
-		keywords=["emergency", "emergencia", "bomberos", "firefighter"],
-	)
-	scans["emergency_elevator"] = {
-		"count": emergency_lift_count,
-		"examples": emergency_lift_examples,
-		"items": emergency_lift_items,
-	}
+		count, examples, items = _count_ifc_elements_by_keywords(
+			ifc_file,
+			entity_types=[str(v) for v in entity_types],
+			keywords=[str(v) for v in keywords],
+		)
+		scans[str(check_key)] = {
+			"count": count,
+			"examples": examples,
+			"items": items,
+		}
 
 	return scans
 
@@ -300,12 +265,13 @@ def _rule_result(
 	evidence: List[str],
 	note: str,
 ) -> Dict[str, Any]:
+	"""Build a normalized rule result payload with PASS/FAIL/NA status."""
 	if not applies:
 		status = "NOT_APPLICABLE"
 	elif required_count is None:
 		status = "MANUAL_REVIEW"
 	else:
-		status = "PASS" if found_count >= required_count else "FAIL"
+		status = "PASS" if found_count >= required_count else "Fa"
 
 	return {
 		"id": rule_id,
@@ -320,7 +286,107 @@ def _rule_result(
 	}
 
 
+def _resolve_rule_applicability(
+	rule_cfg: Dict[str, Any],
+	has_area: bool,
+	area_m2: Optional[float],
+	h_desc_m: Optional[float],
+) -> bool:
+	"""Evaluate whether a rule applies based on config-driven applicability conditions."""
+	applies_cfg = rule_cfg.get("applies", {}) if isinstance(rule_cfg.get("applies"), dict) else {}
+	applies_type = applies_cfg.get("type", "always")
+
+	if applies_type == "always":
+		return True
+
+	if applies_type == "area_gt":
+		value = _to_float(applies_cfg.get("value"))
+		return bool(has_area and area_m2 is not None and value is not None and area_m2 > value)
+
+	if applies_type == "area_gte":
+		value = _to_float(applies_cfg.get("value"))
+		return bool(has_area and area_m2 is not None and value is not None and area_m2 >= value)
+
+	if applies_type == "area_gt_any":
+		values = applies_cfg.get("values", []) if isinstance(applies_cfg.get("values"), list) else []
+		thresholds = [_to_float(v) for v in values]
+		return bool(has_area and area_m2 is not None and any(t is not None and area_m2 > t for t in thresholds))
+
+	if applies_type == "desc_height_gt":
+		value = _to_float(applies_cfg.get("value"))
+		return bool(h_desc_m is not None and value is not None and h_desc_m > value)
+
+	return False
+
+
+def _resolve_required_count(rule_cfg: Dict[str, Any], applies: bool, area_m2: Optional[float]) -> Optional[int]:
+	"""Resolve minimum required count from config using fixed or formula modes."""
+	if not applies:
+		return 0
+
+	required_cfg = rule_cfg.get("required", {}) if isinstance(rule_cfg.get("required"), dict) else {}
+	required_type = required_cfg.get("type", "fixed")
+
+	if required_type == "fixed":
+		value = _to_float(required_cfg.get("value"))
+		return int(value) if value is not None else None
+
+	if required_type == "hydrants_formula":
+		if area_m2 is None or area_m2 < 5000:
+			return 0
+		if area_m2 <= 10000:
+			return 1
+		return 1 + math.ceil((area_m2 - 10000) / 10000)
+
+	return None
+
+
+def _detect_building_use(ifc_file: ifcopenshell.file, ifc_path: str) -> str:
+	"""Infer building use text from all buildings, project metadata, and IFC filename."""
+	parts: List[str] = []
+
+	for b in ifc_file.by_type("IfcBuilding") or []:
+		parts.extend(
+			[
+				_norm(getattr(b, "Name", None)),
+				_norm(getattr(b, "Description", None)),
+				_norm(getattr(b, "ObjectType", None)),
+				_norm(getattr(b, "LongName", None)),
+			]
+		)
+		psets = _safe_get_psets(b)
+		for _, props in psets.items():
+			if isinstance(props, dict):
+				for key, value in props.items():
+					if _norm(key) in {"occupancytype", "buildinguse", "function", "use", "classification"}:
+						parts.append(_norm(value))
+
+	for p in ifc_file.by_type("IfcProject") or []:
+		parts.extend(
+			[
+				_norm(getattr(p, "Name", None)),
+				_norm(getattr(p, "Description", None)),
+				_norm(getattr(p, "LongName", None)),
+			]
+		)
+
+	parts.append(_norm(Path(ifc_path).name))
+	blob = " | ".join([p for p in parts if p])
+	return blob or "unknown"
+
+
+def _is_administrative_building(detected_use_text: str, config: Dict[str, Any]) -> bool:
+	"""Check whether detected building use matches configured administrative keywords."""
+	keywords = [_norm(v) for v in config.get("building_use_keywords", [ADMIN_BUILDING_USE])]
+	target = _norm(config.get("building_use_target", ADMIN_BUILDING_USE))
+	if target and target not in keywords:
+		keywords.append(target)
+	blob = _norm(detected_use_text)
+	return any(keyword and keyword in blob for keyword in keywords)
+
+
 def _get_building_marker(ifc_file: ifcopenshell.file) -> Dict[str, Any]:
+	"""Return a fallback IFC marker when no specific failing items are found."""
 	buildings = ifc_file.by_type("IfcBuilding") or []
 	if buildings:
 		b = buildings[0]
@@ -343,6 +409,7 @@ def _build_non_compliance_highlight(
 	scans: Dict[str, Dict[str, Any]],
 	ifc_file: ifcopenshell.file,
 ) -> Dict[str, Any]:
+	"""Create red highlight payload for non-compliant IFC elements."""
 	red_rgb = [255, 0, 0]
 	items: List[Dict[str, Any]] = []
 	seen: set = set()
@@ -378,37 +445,13 @@ def _build_non_compliance_highlight(
 	}
 
 
-def _build_non_compliance_reasons(rules: List[Dict[str, Any]], missing_data: List[str]) -> List[Dict[str, Any]]:
+def _build_non_compliance_reasons(
+	rules: List[Dict[str, Any]],
+	missing_data: List[str],
+	actions_by_rule: Dict[str, str],
+) -> List[Dict[str, Any]]:
+	"""Build textual reasons and corrective actions for failed rules and data-quality warnings."""
 	reasons: List[Dict[str, Any]] = []
-	actions_by_rule: Dict[str, str] = {
-		"SI4-GEN-EXT": (
-			"Install compliant portable extinguishers (minimum efficacy 21A-113B) and place them so travel distance to an extinguisher "
-			"is at most 15 m on each floor, including special-risk rooms."
-		),
-		"SI4-ADM-BIE": (
-			"Provide at least one BIE (fire hose cabinet) because built area exceeds 2,000 m², and complete hydraulic design/commissioning "
-			"according to RIPCI."
-		),
-		"SI4-ADM-COL-SEC": (
-			"Provide a dry riser because evacuation height exceeds 24 m, unless the municipality allows the alternative system permitted by note (5)."
-		),
-		"SI4-ADM-ALARM": (
-			"Install a fire alarm system because built area exceeds 1,000 m²; ensure it provides both acoustic and visual alarm signals."
-		),
-		"SI4-ADM-DET": (
-			"Install automatic detection: at least in high-risk rooms when area exceeds 2,000 m², and throughout the building when area exceeds 5,000 m²."
-		),
-		"SI4-ADM-HYD": (
-			"Provide the required number of external hydrants (1 between 5,000–10,000 m², plus 1 per additional 10,000 m² or fraction), "
-			"or document qualifying public hydrants within 100 m."
-		),
-		"SI4-GEN-LIFT": (
-			"Provide at least one emergency/firefighter elevator because evacuation height exceeds 28 m."
-		),
-		"SI4-GEN-AUTO-EXT": (
-			"Provide an automatic extinguishing system because evacuation height exceeds 80 m."
-		),
-	}
 
 	for rule in rules:
 		if rule.get("status") != "FAIL":
@@ -450,152 +493,96 @@ def _build_non_compliance_reasons(rules: List[Dict[str, Any]], missing_data: Lis
 	return reasons
 
 
-def check_si4_administrativo(ifc_path: str) -> Dict[str, Any]:
+def check_si4_administrativo(ifc_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
+	"""Run SI-4 verification for administrative buildings using JSON-driven parameters."""
 	file_name = Path(ifc_path).name
+	building_use_target = str(config.get("building_use_target", ADMIN_BUILDING_USE))
 	try:
 		ifc_file = ifcopenshell.open(ifc_path)
 	except Exception as exc:
 		return {
 			"file_name": file_name,
-			"building_use": ADMIN_BUILDING_USE,
+			"building_use": building_use_target,
 			"error": f"Failed to open IFC file: {exc}",
 		}
 
-	area_m2 = _calc_total_constructed_area_m2(ifc_file)
+	detected_building_use = _detect_building_use(ifc_file, ifc_path)
+	if not _is_administrative_building(detected_building_use, config):
+		return {
+			"file_name": file_name,
+			"building_use": detected_building_use,
+			"target_building_use": building_use_target,
+			"complies": False,
+			"highlight": {"rgb_non_compliant": [255, 0, 0], "items": []},
+			"non_compliance_reasons": [
+				{
+					"rule_id": "BUILDING-USE",
+					"requirement": f"Building use must be {building_use_target}",
+					"reason": "El edificio no se ha identificado como Administrativo. El chequeo SI-4 no se ejecuta.",
+					"what_to_do": "Revise la clasificación de uso del edificio en el IFC o ejecute el checker correspondiente al uso real.",
+					"detail": f"Uso detectado: {detected_building_use}",
+				}
+			],
+			"source_regulation": "utils/regulation.txt (SI 4, Tabla 1.1, fila Administrativo + reglas generales)",
+			"metrics": {
+				"total_constructed_area_m2": None,
+				"evacuation_height_descending_m": None,
+				"evacuation_height_ascending_m": None,
+				"storey_count": 0,
+			},
+			"detected_installations": {},
+			"requirements": [],
+			"summary": {
+				"overall_status": "NOT_EXECUTED",
+				"complies": False,
+				"pass": 0,
+				"fail": 0,
+				"not_applicable": 0,
+				"manual_review": 0,
+				"missing_data_warnings": ["Chequeo no ejecutado por uso distinto de Administrativo."],
+			},
+		}
+
+	area_m2 = _calc_total_constructed_area_m2(ifc_file, config)
 	h_desc_m, h_asc_m, storey_count = _calc_evacuation_heights_m(ifc_file)
-	scans = _scan_installations(ifc_file)
+	scans = _scan_installations(ifc_file, config)
 
 	has_area = area_m2 is not None
-	has_heights = h_desc_m is not None and h_asc_m is not None
 
 	rules: List[Dict[str, Any]] = []
+	for rule_cfg in config.get("rules", []):
+		if not isinstance(rule_cfg, dict):
+			continue
 
-	rules.append(
-		_rule_result(
-			"SI4-GEN-EXT",
-			"Extintores portátiles (en general)",
-			"portable_extinguishers",
-			applies=True,
-			required_count=1,
-			found_count=scans["portable_extinguishers"]["count"],
-			evidence=scans["portable_extinguishers"]["examples"],
-			note="La separación máxima de 15 m no puede verificarse automáticamente sin geometría de recorridos.",
+		rule_id = str(rule_cfg.get("id", "UNKNOWN"))
+		check_key = str(rule_cfg.get("check_key", ""))
+		requirement = str(rule_cfg.get("requirement", ""))
+		note = str(rule_cfg.get("note", ""))
+
+		applies = _resolve_rule_applicability(rule_cfg, has_area, area_m2, h_desc_m)
+		required_count = _resolve_required_count(rule_cfg, applies, area_m2)
+
+		scan_entry = scans.get(check_key, {})
+		found_count = int(scan_entry.get("count", 0))
+		evidence = scan_entry.get("examples", []) if isinstance(scan_entry.get("examples", []), list) else []
+
+		rules.append(
+			_rule_result(
+				rule_id,
+				requirement,
+				check_key,
+				applies,
+				required_count,
+				found_count,
+				[str(v) for v in evidence],
+				note,
+			)
 		)
-	)
-
-	applies_bie_admin = bool(has_area and area_m2 > 2000)
-	rules.append(
-		_rule_result(
-			"SI4-ADM-BIE",
-			"Bocas de incendio equipadas si superficie construida > 2.000 m²",
-			"fire_hose_cabinets_bie",
-			applies=applies_bie_admin,
-			required_count=1 if applies_bie_admin else 0,
-			found_count=scans["fire_hose_cabinets_bie"]["count"],
-			evidence=scans["fire_hose_cabinets_bie"]["examples"],
-			note="Comprobación mínima por existencia de equipos BIE.",
-		)
-	)
-
-	applies_dry_riser = bool(has_heights and h_desc_m > 24)
-	rules.append(
-		_rule_result(
-			"SI4-ADM-COL-SEC",
-			"Columna seca si altura de evacuación descendente > 24 m",
-			"dry_riser",
-			applies=applies_dry_riser,
-			required_count=1 if applies_dry_riser else 0,
-			found_count=scans["dry_riser"]["count"],
-			evidence=scans["dry_riser"]["examples"],
-			note="En algunos municipios puede sustituirse por BIE (nota 5 de tabla).",
-		)
-	)
-
-	applies_alarm = bool(has_area and area_m2 > 1000)
-	rules.append(
-		_rule_result(
-			"SI4-ADM-ALARM",
-			"Sistema de alarma si superficie construida > 1.000 m²",
-			"alarm_system",
-			applies=applies_alarm,
-			required_count=1 if applies_alarm else 0,
-			found_count=scans["alarm_system"]["count"],
-			evidence=scans["alarm_system"]["examples"],
-			note="Debe transmitir señal visual y acústica; esa parte requiere revisión manual.",
-		)
-	)
-
-	applies_detection_zone = bool(has_area and area_m2 > 2000)
-	applies_detection_full = bool(has_area and area_m2 > 5000)
-	det_note = (
-		"Si >2.000 m² se exigen detectores en zonas de riesgo alto; "
-		"si >5.000 m² en todo el edificio. Cobertura exacta requiere validación espacial/manual."
-	)
-	rules.append(
-		_rule_result(
-			"SI4-ADM-DET",
-			"Sistema de detección de incendio según umbral de superficie",
-			"fire_detection",
-			applies=applies_detection_zone or applies_detection_full,
-			required_count=1 if (applies_detection_zone or applies_detection_full) else 0,
-			found_count=scans["fire_detection"]["count"],
-			evidence=scans["fire_detection"]["examples"],
-			note=det_note,
-		)
-	)
-
-	hydrants_required = 0
-	if has_area and area_m2 >= 5000:
-		if area_m2 <= 10000:
-			hydrants_required = 1
-		else:
-			hydrants_required = 1 + math.ceil((area_m2 - 10000) / 10000)
-
-	rules.append(
-		_rule_result(
-			"SI4-ADM-HYD",
-			"Hidrantes exteriores por superficie (Administrativo)",
-			"external_hydrants",
-			applies=hydrants_required > 0,
-			required_count=hydrants_required if hydrants_required > 0 else 0,
-			found_count=scans["external_hydrants"]["count"],
-			evidence=scans["external_hydrants"]["examples"],
-			note="Pueden computarse hidrantes en vía pública a menos de 100 m (nota 3).",
-		)
-	)
-
-	applies_emergency_lift = bool(has_heights and h_desc_m > 28)
-	rules.append(
-		_rule_result(
-			"SI4-GEN-LIFT",
-			"Ascensor de emergencia si altura de evacuación descendente > 28 m",
-			"emergency_elevator",
-			applies=applies_emergency_lift,
-			required_count=1 if applies_emergency_lift else 0,
-			found_count=scans["emergency_elevator"]["count"],
-			evidence=scans["emergency_elevator"]["examples"],
-			note="Regla general de tabla 1.1.",
-		)
-	)
-
-	applies_auto_ext = bool(has_heights and h_desc_m > 80)
-	rules.append(
-		_rule_result(
-			"SI4-GEN-AUTO-EXT",
-			"Instalación automática de extinción si altura de evacuación > 80 m",
-			"automatic_extinguishing",
-			applies=applies_auto_ext,
-			required_count=1 if applies_auto_ext else 0,
-			found_count=scans["automatic_extinguishing"]["count"],
-			evidence=scans["automatic_extinguishing"]["examples"],
-			note="Regla general de tabla 1.1.",
-		)
-	)
 
 	missing_data: List[str] = []
 	if not has_area:
 		missing_data.append("No se ha podido calcular la superficie construida a partir de IfcSpace.")
-	if not has_heights:
+	if h_desc_m is None or h_asc_m is None:
 		missing_data.append("No se ha podido calcular la altura de evacuación desde IfcBuildingStorey.Elevation.")
 
 	fail_count = sum(1 for r in rules if r["status"] == "FAIL")
@@ -609,11 +596,13 @@ def check_si4_administrativo(ifc_path: str) -> Dict[str, Any]:
 
 	complies = fail_count == 0
 	highlight = _build_non_compliance_highlight(rules, scans, ifc_file)
-	non_compliance_reasons = _build_non_compliance_reasons(rules, missing_data)
+	actions_by_rule = config.get("actions_by_rule", {}) if isinstance(config.get("actions_by_rule"), dict) else {}
+	non_compliance_reasons = _build_non_compliance_reasons(rules, missing_data, actions_by_rule)
 
 	return {
 		"file_name": file_name,
-		"building_use": ADMIN_BUILDING_USE,
+		"building_use": building_use_target,
+		"detected_building_use": detected_building_use,
 		"complies": complies,
 		"highlight": highlight,
 		"non_compliance_reasons": non_compliance_reasons,
@@ -638,66 +627,61 @@ def check_si4_administrativo(ifc_path: str) -> Dict[str, Any]:
 	}
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-	parser = argparse.ArgumentParser(
-		description="Check SI-4 fire protection compliance for Administrativo buildings using IFC (ifcopenshell)."
-	)
-	parser.add_argument("--ifc", required=False, help="Path to IFC file")
-	parser.add_argument(
-		"--json-out",
-		default=None,
-		help="Optional path to write JSON report",
-	)
-	parser.add_argument(
-		"--full-report",
-		action="store_true",
-		help="Print complete report instead of the minimal boolean + RGB payload.",
-	)
-	return parser
+def _resolve_ifc_input(config: Dict[str, Any]) -> str:
+	"""Resolve IFC input path from JSON config first, then from script constant fallback."""
+	ifc_in_json = str(config.get("ifc_input_path", "")).strip()
+	if ifc_in_json:
+		return ifc_in_json
 
+	if DEFAULT_IFC_INPUT_PATH.strip():
+		return DEFAULT_IFC_INPUT_PATH.strip()
 
-def _resolve_ifc_input(arg_ifc_path: Optional[str]) -> str:
-	if arg_ifc_path and arg_ifc_path.strip():
-		return arg_ifc_path.strip()
-
-	user_input = input("Enter IFC file path: ").strip()
-	if not user_input:
-		raise ValueError("IFC path is required.")
-	return user_input
+	raise ValueError(
+		"IFC path is required. Set `ifc_input_path` in data_push/SI_4_table.json or set DEFAULT_IFC_INPUT_PATH in this script."
+	)
 
 
 def main() -> int:
-	parser = _build_arg_parser()
-	args = parser.parse_args()
+	"""Entrypoint: load config, execute SI-4 check, print result, and optionally persist report."""
 	try:
-		ifc_path = _resolve_ifc_input(args.ifc)
-	except ValueError as exc:
-		print(json.dumps({"complies": False, "error": str(exc)}, ensure_ascii=False))
+		config = _load_si4_table_config()
+		ifc_path = _resolve_ifc_input(config)
+	except Exception as exc:
+		print(json.dumps({"overall_status": False, "reason": str(exc)}, ensure_ascii=False))
 		return 2
 
-	report = check_si4_administrativo(ifc_path)
+	report = check_si4_administrativo(ifc_path, config)
+	summary_status = report.get("summary", {}).get("overall_status")
+	overall_status = summary_status if isinstance(summary_status, bool) else bool(report.get("complies", False))
 
-	minimal_output = {
-		"ifc_file": report.get("file_name"),
-		"complies": report.get("complies", False),
-		"rgb_non_compliant": report.get("highlight", {}).get("rgb_non_compliant", [255, 0, 0]),
-		"non_compliant_items": report.get("highlight", {}).get("items", []),
-		"why_not_compliant": report.get("non_compliance_reasons", []),
-	}
+	minimal_output: Dict[str, Any] = {"overall_status": overall_status}
+	if not overall_status:
+		reasons_raw = report.get("non_compliance_reasons", [])
+		reasons: List[str] = []
+		if isinstance(reasons_raw, list):
+			for item in reasons_raw:
+				if isinstance(item, dict):
+					reason_text = item.get("reason")
+					if reason_text:
+						reasons.append(str(reason_text))
+				else:
+					reasons.append(str(item))
+		minimal_output["why_not_compliant"] = reasons
 
-	if args.full_report:
+	if PRINT_FULL_REPORT:
 		print(json.dumps(report, indent=2, ensure_ascii=False))
 	else:
 		print(json.dumps(minimal_output, indent=2, ensure_ascii=False))
 
-	if args.json_out:
-		out_path = Path(args.json_out)
+	json_out_path = config.get("json_out_path") or DEFAULT_JSON_OUT_PATH
+	if json_out_path:
+		out_path = Path(str(json_out_path))
 		out_path.parent.mkdir(parents=True, exist_ok=True)
 		out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
 	if "error" in report:
 		return 2
-	if report.get("summary", {}).get("overall_status") == "FAIL":
+	if overall_status is False:
 		return 1
 	return 0
 

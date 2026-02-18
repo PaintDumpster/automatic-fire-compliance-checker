@@ -372,7 +372,13 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
         "IfcBeam",
         "IfcColumn",
         "IfcSlab",
-        "IfcMember"
+        "IfcMember",
+        "IfcWall",
+        "IfcFooting",
+        "IfcRoof",
+        "IfcStair",
+        "IfcStairFlight",
+        "IfcRailing",
     ]
 
     # Results report
@@ -428,15 +434,20 @@ if __name__ == "__main__":
     # Ensure logging is configured when executed as a script
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-    '''# --- Test 1: Residential building, 20m evacuation height ---
+    # --- Test 1: Auto-detect building use and height from IFC ---
+    ifc_path = "00_data/ifc_models/01_Duplex_Apartment.ifc"
+    model = ifcopenshell.open(ifc_path)
+    building_use = extract_building_use_from_ifc(model)
+    evacuation_height_m = extract_evacuation_height_from_ifc(model)
+
     report = check_si6_compliance(
-        ifc_path            = "00_data/ifc_models/01_Duplex_Apartment.ifc",
-        building_use        = "residential",
-        evacuation_height_m = 20
+        ifc_path            = ifc_path,
+        building_use        = building_use,
+        evacuation_height_m = evacuation_height_m
     )
 
     print("=" * 50)
-    print("TEST 1 — Residential, 20m")
+    print(f"TEST 1 — {building_use.replace('_', ' ').title()}, {evacuation_height_m:.1f}m")
     print("=" * 50)
     print(f"Required R rating  : R{report['required_R']}")
     print(f"Compliant elements : {len(report['compliant'])}")
@@ -454,142 +465,7 @@ if __name__ == "__main__":
     if report["no_data"]:
         print("\nElements with missing fire rating data:")
         for el in report["no_data"]:
-            print(f"  [{el['type']}] {el['name']} — {el['issue']}")'''
-
-    # --- Test 2: Auto-extract IFC file parameters and check structural fire compliance ---
-    print("\n" + "=" * 70)
-    print("TEST 2 — Automatic IFC Analysis & Structural Fire Compliance Check")
-    print("=" * 70)
-    
-    ifc_file_path = "00_data/ifc_models/Ifc4_Revit_ARC_FireRatingAdded.ifc"
-    print(f"\nIFC File: {ifc_file_path}")
-    
-    # Automatically extract building parameters
-    model = ifcopenshell.open(ifc_file_path)
-    auto_building_use = extract_building_use_from_ifc(model)
-    auto_evacuation_height = extract_evacuation_height_from_ifc(model)
-    
-    print("\n--- Automatically Extracted Parameters ---")
-    print(f"Building Use         : {auto_building_use.upper()}")
-    print(f"Evacuation Height    : {auto_evacuation_height}m")
-    
-    # Get structural element information
-    all_beams = model.by_type("IfcBeam")
-    all_columns = model.by_type("IfcColumn")
-    all_slabs = model.by_type("IfcSlab")
-    all_members = model.by_type("IfcMember")
-    total_structural = len(all_beams) + len(all_columns) + len(all_slabs) + len(all_members)
-    
-    print(f"\n--- Structural Elements Found ---")
-    print(f"Beams                : {len(all_beams)}")
-    print(f"Columns              : {len(all_columns)}")
-    print(f"Slabs                : {len(all_slabs)}")
-    print(f"Members              : {len(all_members)}")
-    print(f"Total Elements       : {total_structural}")
-    
-    # Run structural fire compliance check
-    print(f"\n--- Running Structural Fire Compliance Check ---")
-    report2 = check_si6_compliance(
-        ifc_path            = ifc_file_path,
-        building_use        = auto_building_use,
-        evacuation_height_m = auto_evacuation_height
-    )
-    
-    print(f"\nRequired Fire Resistance (SI 6 Table 3.1) : R{report2['required_R']} minutes")
-    print(f"Compliant Elements   : {len(report2['compliant'])}")
-    print(f"Non-Compliant        : {len(report2['non_compliant'])}")
-    print(f"Missing Fire Rating  : {len(report2['no_data'])}")
-    print(f"\n✓ OVERALL STRUCTURAL COMPLIANCE: {('PASS ✓' if report2['overall_compliant'] else 'FAIL ✗')}")
-    
-    if report2["non_compliant"]:
-        print(f"\n--- Non-Compliant Structural Elements ({len(report2['non_compliant'])}) ---")
-        for i, el in enumerate(report2["non_compliant"][:5], 1):
-            deficit = el.get('deficit', el['required_R'] - (el['actual_R'] or 0))
-            print(f"{i}. [{el['type']}] {el['name']}")
-            print(f"   Required: R{el['required_R']} | Actual: R{el['actual_R'] or 'N/A'} | Deficit: {deficit} min")
-        if len(report2["non_compliant"]) > 5:
-            print(f"   ... and {len(report2['non_compliant']) - 5} more non-compliant elements")
-    
-    if report2["no_data"]:
-        print(f"\n--- Structural Elements With Missing Fire Rating Data ({len(report2['no_data'])}) ---")
-        material_missing = {}
-        for el in report2["no_data"]:
-            material_missing[el['type']] = material_missing.get(el['type'], 0) + 1
-        
-        for elem_type, count in material_missing.items():
-            print(f"  {elem_type}: {count} elements without FireRating property")
-    
-    print("\n" + "=" * 70)
+            print(f"  [{el['type']}] {el['name']} — {el['issue']}")
 
 
-# ─────────────────────────────────────────────
-# DEBUG / INSPECTION UTILITIES
-# ─────────────────────────────────────────────
 
-def find_element_by_globalid(model, gid):
-    """Find an element in the model by its GlobalId."""
-    for t in ("IfcBeam", "IfcColumn", "IfcSlab", "IfcMember", "IfcWall", "IfcElement"):
-        for el in model.by_type(t):
-            if getattr(el, 'GlobalId', None) == gid:
-                return el
-    return None
-
-
-def inspect_element(element):
-    """Print detailed property information for an element."""
-    if element is None:
-        print('  Element not found')
-        return
-    print('  Type:', element.is_a())
-    print('  Name:', getattr(element, 'Name', None))
-    print('  ObjectType:', getattr(element, 'ObjectType', None))
-    for rel in getattr(element, 'IsDefinedBy', []):
-        if rel.is_a('IfcRelDefinesByProperties'):
-            pset = rel.RelatingPropertyDefinition
-            print('  Property set:', getattr(pset, 'Name', '(no name)'))
-            if hasattr(pset, 'HasProperties'):
-                for prop in pset.HasProperties:
-                    pname = getattr(prop, 'Name', '(no name)')
-                    val = getattr(prop, 'NominalValue', None) or getattr(prop, 'Value', None)
-                    raw = getattr(val, 'wrappedValue', val)
-                    print(f"    - {pname}: {repr(raw)}")
-
-
-def inspect_compliance_report(ifc_path, building_use, evacuation_height_m):
-    """Deep-dive inspection of compliance report, printing raw properties of non-compliant/missing elements."""
-    print("\n" + "=" * 70)
-    print("DETAILED INSPECTION — Raw Properties & Fire Rating Analysis")
-    print("=" * 70)
-    
-    model = ifcopenshell.open(ifc_path)
-    report = check_si6_compliance(ifc_path, building_use, evacuation_height_m)
-    
-    print(f"\nReport summary:")
-    print(f"  Required_R    : R{report.get('required_R')} minutes")
-    print(f"  Compliant     : {len(report.get('compliant', []))}")
-    print(f"  Non-compliant : {len(report.get('non_compliant', []))}")
-    print(f"  Missing data  : {len(report.get('no_data', []))}")
-    
-    # Show non-compliant details
-    if report.get('non_compliant'):
-        print(f"\n--- Non-Compliant Elements ({len(report['non_compliant'])}) ---")
-        for el in report['non_compliant'][:5]:
-            print(f"\nElement: {el.get('name')} (GlobalId: {el.get('id')})")
-            print(f"  Actual: R{el.get('actual_R')} | Required: R{el.get('required_R')} | Deficit: {el.get('deficit')} min")
-            element = find_element_by_globalid(model, el.get('id'))
-            inspect_element(element)
-        if len(report['non_compliant']) > 5:
-            print(f"\n  ... and {len(report['non_compliant']) - 5} more non-compliant elements")
-    
-    # Show missing data details
-    if report.get('no_data'):
-        print(f"\n--- Missing Fire Rating Data ({len(report['no_data'])}) ---")
-        for el in report['no_data'][:5]:
-            print(f"\nElement: {el.get('name')} (GlobalId: {el.get('id')})")
-            print(f"  Issue: {el.get('issue')}")
-            element = find_element_by_globalid(model, el.get('id'))
-            inspect_element(element)
-        if len(report['no_data']) > 5:
-            print(f"\n  ... and {len(report['no_data']) - 5} more elements with missing data")
-    
-    print("\n" + "=" * 70)

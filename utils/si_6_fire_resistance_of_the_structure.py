@@ -55,7 +55,7 @@ FIRE_RATING_FIELD_VARIANTS = [
     "resistencia",
 ]
 
-import re
+import re # for parsing minutes from FireRating values
 
 
 def _match_building_use(text):
@@ -97,21 +97,53 @@ def _parse_minutes_from_value(val):
     return None
 
 
-def get_default_fire_rating(building_use):
-    """Get the default fire rating (minutes) for a building use.
+def get_default_fire_rating(building_use, element_type=None):
+    """Get the default fire rating (minutes) for a building use and optional element type.
     
     This is used when an element has no FireRating property.
-    Falls back to the minimum required rating for the given use.
+    Falls back from element-type-specific rating to generic building use rating.
+    
+    Priority:
+        1. si6_table_3_1.json — element type specific (e.g., IfcColumn for residential)
+        2. si6_table_3_1.json — generic rating for building use
+        3. Legacy fallback — simple defaults for building use
     """
+    key = _normalize_use_label(building_use)
+    
+    # Try element-type-specific rating from _default_fire_ratings_by_element_type
+    if element_type:
+        try:
+            element_types_ratings = _SI6_DATA.get("_default_fire_ratings_by_element_type", {})
+            use_ratings = element_types_ratings.get(key, {})
+            if element_type in use_ratings:
+                rating = use_ratings[element_type]
+                logger.debug("Found element-type-specific fire rating for %s/%s: %s minutes", key, element_type, rating)
+                return rating
+        except Exception as e:
+            logger.debug("Failed to get element-type-specific rating: %s", e)
+    
+    # Try generic rating for building use in _default_fire_ratings_by_element_type
+    try:
+        element_types_ratings = _SI6_DATA.get("_default_fire_ratings_by_element_type", {})
+        use_ratings = element_types_ratings.get(key, {})
+        if "generic" in use_ratings:
+            rating = use_ratings["generic"]
+            logger.debug("Found generic fire rating for %s: %s minutes", key, rating)
+            return rating
+    except Exception as e:
+        logger.debug("Failed to get generic rating: %s", e)
+    
+    # Fallback to simple _defaults
     try:
         defaults = _SI6_DATA.get("_defaults", {})
-        key = _normalize_use_label(building_use)
         default = defaults.get(key)
         if default is not None:
-            logger.debug("Using default fire rating for use '%s': %s minutes", building_use, default)
+            logger.debug("Using fallback default fire rating for use '%s': %s minutes", building_use, default)
             return default
     except Exception as e:
         logger.debug("Failed to get default fire rating: %s", e)
+    
+    logger.debug("No default fire rating found for use '%s'", building_use)
     return None
 
 
@@ -214,17 +246,22 @@ def get_required_R(building_use, evacuation_height_m, is_basement=False):
     return use.get(band)
 
 
-def get_fire_rating(element, building_use=None):
+def get_fire_rating(element, building_use=None, element_type=None):
     """
     Reads the FireRating property from an IFC element.
     Returns an integer (minutes) or None if not found.
     e.g. 'R90' → 90
     
     If the element has no FireRating property and building_use is provided,
-    falls back to the default rating for that building use.
+    falls back to the default rating for that building use and element type.
     
     Only accepts properties with fire-rating-related names to avoid false positives
     from generic numeric properties.
+    
+    Parameters:
+        element (IfcElement) - IFC element to check
+        building_use (str) - e.g. 'residential', 'commercial' (for fallback)
+        element_type (str) - e.g. 'IfcWall', 'IfcColumn' (for type-specific defaults)
     """
     for rel in getattr(element, 'IsDefinedBy', []):
         if rel.is_a("IfcRelDefinesByProperties"):
@@ -252,10 +289,10 @@ def get_fire_rating(element, building_use=None):
 
     # No explicit FireRating found; try default for building use
     if building_use:
-        default = get_default_fire_rating(building_use)
+        default = get_default_fire_rating(building_use, element_type)
         if default is not None:
-            logger.debug("No explicit FireRating for element %s; using default %s minutes for use '%s'", 
-                        getattr(element, 'GlobalId', '(no id)'), default, building_use)
+            logger.debug("No explicit FireRating for element %s; using default %s minutes for use '%s' type '%s'", 
+                        getattr(element, 'GlobalId', '(no id)'), default, building_use, element_type or 'unknown')
             return default
 
     logger.debug("No FireRating found for element %s", getattr(element, 'GlobalId', '(no id)'))
@@ -338,7 +375,7 @@ def extract_evacuation_height_from_ifc(model):
     return max_elevation
 
 
-def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basement=False):
+def get_si6_compliance_details(ifc_path, building_use, evacuation_height_m, is_basement=False):
     """
     Checks all primary structural elements in an IFC file against
     SI 6 fire resistance requirements.
@@ -352,10 +389,11 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
     Returns:
         dict with keys:
             required_R        — minimum R value required (int, minutes)
+            building_use      — building use category
+            evacuation_height — evacuation height in metres
             compliant         — list of passing elements
             non_compliant     — list of failing elements
             no_data           — list of elements with no FireRating found
-            overall_compliant — True only if no failures and no missing data
     """
 
     # Open the IFC file
@@ -395,7 +433,7 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
     for ifc_type in element_types:
         for element in model.by_type(ifc_type):
             name     = element.Name or element.GlobalId
-            actual_R = get_fire_rating(element, building_use)
+            actual_R = get_fire_rating(element, building_use, element_type=ifc_type)
 
             entry = {
                 "id":         element.GlobalId,
@@ -416,13 +454,120 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
                 entry["deficit"] = required_R - actual_R
                 results["non_compliant"].append(entry)
 
-    # Overall pass only if zero failures AND zero missing data
-    results["overall_compliant"] = (
-        len(results["non_compliant"]) == 0 and
-        len(results["no_data"])       == 0
+    return results
+
+
+def is_si6_compliant(ifc_path, building_use, evacuation_height_m, is_basement=False):
+    """
+    Quick check: returns True if IFC is fully compliant with SI 6 requirements, False otherwise.
+    
+    An IFC is compliant only if:
+      - Zero non-compliant elements (no failing fire rating), AND
+      - Zero elements with missing fire rating data
+
+    Parameters:
+        ifc_path            (str)   : path to the .ifc file
+        building_use        (str)   : e.g. 'residential', 'commercial'
+        evacuation_height_m (float) : building evacuation height in metres
+        is_basement         (bool)  : True if checking a basement floor
+
+    Returns:
+        bool: True if overall compliant, False otherwise
+    """
+    details = get_si6_compliance_details(ifc_path, building_use, evacuation_height_m, is_basement)
+    
+    # Handle error case
+    if "error" in details:
+        return False
+    
+    # Compliant only if zero failures AND zero missing data
+    return (
+        len(details["non_compliant"]) == 0 and
+        len(details["no_data"]) == 0
     )
 
-    return results
+
+def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basement=False):
+    """
+    Deprecated: Use get_si6_compliance_details() for full report or is_si6_compliant() for boolean.
+    
+    This function is kept for backward compatibility.
+    """
+    details = get_si6_compliance_details(ifc_path, building_use, evacuation_height_m, is_basement)
+    if "error" not in details:
+        details["overall_compliant"] = (
+            len(details["non_compliant"]) == 0 and
+            len(details["no_data"]) == 0
+        )
+    return details
+
+
+def export_check_results_to_json(results, output_path=None):
+    """
+    Exports SI 6 compliance check results to JSON file in standardized format.
+    Stores ONLY failing elements (non-compliant).
+    
+    Parameters:
+        results (dict) - Output from get_si6_compliance_details()
+        output_path (str) - Path to save JSON file. Defaults to data_push/si6_compliance_check_result.json
+    
+    Returns:
+        str - Path to the exported JSON file
+    """
+    if output_path is None:
+        output_path = os.path.join(os.path.dirname(__file__), "..", "data_push", "si6_compliance_check_result.json")
+    
+    output_path = os.path.abspath(output_path)
+    
+    # Build check results array - ONLY failing elements
+    check_results = []
+    check_id = 1
+    
+    # Add non-compliant elements (status: fail)
+    for el in results.get("non_compliant", []):
+        check_results.append({
+            "id": f"CHECK_{check_id:06d}",
+            "check_result_id": el["id"],
+            "element_id": el["id"],
+            "element_type": el["type"],
+            "element_name": el["name"],
+            "element_name_long": el["name"],
+            "check_status": "fail",
+            "actual_value": f"R{el['actual_R']}" if el['actual_R'] is not None else None,
+            "required_value": f"R{el['required_R']}",
+            "comment": f"Deficit: {el.get('deficit', 'N/A')} minutes",
+            "log": f"Element has R{el['actual_R']}, needs R{el['required_R']}"
+        })
+        check_id += 1
+    
+    # Build final output JSON
+    output_json = {
+        "metadata": {
+            "description": "SI 6 Fire Resistance Compliance Check Results (Failing Elements Only)",
+            "version": "1.0",
+            "building_use": results.get("building_use"),
+            "evacuation_height_m": results.get("evacuation_height"),
+            "required_R": results.get("required_R"),
+            "summary": {
+                "total_elements_checked": len(results.get("compliant", [])) + len(results.get("non_compliant", [])) + len(results.get("no_data", [])),
+                "compliant": len(results.get("compliant", [])),
+                "non_compliant": len(results.get("non_compliant", [])),
+                "missing_data": len(results.get("no_data", []))
+            }
+        },
+        "check_results": check_results
+    }
+    
+    # Write to file
+    try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(output_json, f, indent=2, ensure_ascii=False)
+        logger.info("Check results (failing elements only) exported to: %s", output_path)
+        return output_path
+    except Exception as e:
+        logger.error("Failed to export check results: %s", e)
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -435,25 +580,38 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
     # --- Test 1: Auto-detect building use and height from IFC ---
-    ifc_path = "00_data/ifc_models/01_Duplex_Apartment.ifc"
+    ifc_path = "00_data/ifc_models/Ifc4_Revit_ARC_FireRatingAdded.ifc"
     model = ifcopenshell.open(ifc_path)
     building_use = extract_building_use_from_ifc(model)
     evacuation_height_m = extract_evacuation_height_from_ifc(model)
 
-    report = check_si6_compliance(
+    print("=" * 50)
+    print(f"TEST 1 — {building_use.replace('_', ' ').title()}, {evacuation_height_m:.1f}m")
+    print("=" * 50)
+    
+    # Get boolean compliance result
+    is_compliant = is_si6_compliant(
+        ifc_path            = ifc_path,
+        building_use        = building_use,
+        evacuation_height_m = evacuation_height_m
+    )
+    
+    # Get detailed compliance report
+    report = get_si6_compliance_details(
         ifc_path            = ifc_path,
         building_use        = building_use,
         evacuation_height_m = evacuation_height_m
     )
 
-    print("=" * 50)
-    print(f"TEST 1 — {building_use.replace('_', ' ').title()}, {evacuation_height_m:.1f}m")
-    print("=" * 50)
+    # Overall Compliance Status
+    print(f"\nOVERALL COMPLIANT: {is_compliant}\n")
+    print("-" * 50)
+    
+    # Detailed Breakdown
     print(f"Required R rating  : R{report['required_R']}")
     print(f"Compliant elements : {len(report['compliant'])}")
     print(f"Non-compliant      : {len(report['non_compliant'])}")
     print(f"Missing data       : {len(report['no_data'])}")
-    print(f"Overall compliant  : {report['overall_compliant']}")
 
     if report["non_compliant"]:
         print("\nFailing elements:")
@@ -466,6 +624,10 @@ if __name__ == "__main__":
         print("\nElements with missing fire rating data:")
         for el in report["no_data"]:
             print(f"  [{el['type']}] {el['name']} — {el['issue']}")
+    
+    # Export results to JSON
+    json_output_path = export_check_results_to_json(report)
+    print(f"\n[OK] Results exported to: {json_output_path}")
 
 
 

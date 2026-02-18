@@ -252,3 +252,258 @@
 		"SI4-GEN-AUTO-EXT": "Provide an automatic extinguishing system because evacuation height exceeds 80 m."
 	}
 }
+
+{
+	"ifc_input_path": "C:\\Users\\hugov\\Downloads\\04N02-36_GVA_NNN-NNN_AR_M3D_NN_02_Administrativo.ifc",
+	"building_use_target": "Administrativo",
+	"building_use_keywords": [
+		"administrativo",
+		"administrative",
+		"office"
+	],
+	"space_area_quantity_keys": [
+		"netfloorarea",
+		"grossfloorarea",
+		"area",
+		"net area",
+		"gross area",
+		"floorarea",
+		"floor area"
+	],
+	"space_area_pset": {
+		"name": "Qto_SpaceBaseQuantities",
+		"keys": [
+			"NetFloorArea",
+			"GrossFloorArea"
+		]
+	},
+	"scan_definitions": {
+		"portable_extinguishers": {
+			"entity_types": [
+				"IfcFireSuppressionTerminal",
+				"IfcFlowTerminal",
+				"IfcProxy"
+			],
+			"keywords": [
+				"extintor",
+				"extinguisher",
+				"21a",
+				"113b"
+			]
+		},
+		"fire_hose_cabinets_bie": {
+			"entity_types": [
+				"IfcFireSuppressionTerminal",
+				"IfcFlowTerminal",
+				"IfcProxy"
+			],
+			"keywords": [
+				"bie",
+				"boca de incendio",
+				"hose reel",
+				"fire hose cabinet"
+			]
+		},
+		"dry_riser": {
+			"entity_types": [
+				"IfcDistributionSystem",
+				"IfcPipeSegment",
+				"IfcPipeFitting",
+				"IfcProxy"
+			],
+			"keywords": [
+				"columna seca",
+				"dry riser"
+			]
+		},
+		"alarm_system": {
+			"entity_types": [
+				"IfcAlarm",
+				"IfcSensor",
+				"IfcAlarmType",
+				"IfcProxy"
+			],
+			"keywords": [
+				"alarm",
+				"alarma",
+				"manual call point",
+				"pulsador"
+			]
+		},
+		"fire_detection": {
+			"entity_types": [
+				"IfcSensor",
+				"IfcAlarm",
+				"IfcProxy"
+			],
+			"keywords": [
+				"detector",
+				"smoke detector",
+				"heat detector",
+				"detector de incend"
+			]
+		},
+		"external_hydrants": {
+			"entity_types": [
+				"IfcFireSuppressionTerminal",
+				"IfcFlowTerminal",
+				"IfcProxy"
+			],
+			"keywords": [
+				"hidrante",
+				"hydrant"
+			]
+		},
+		"automatic_extinguishing": {
+			"entity_types": [
+				"IfcSprinkler",
+				"IfcFireSuppressionTerminal",
+				"IfcProxy"
+			],
+			"keywords": [
+				"sprinkler",
+				"rociador",
+				"extincion automatica",
+				"extinción automática"
+			]
+		},
+		"emergency_elevator": {
+			"entity_types": [
+				"IfcTransportElement",
+				"IfcElevator",
+				"IfcProxy"
+			],
+			"keywords": [
+				"emergency",
+				"emergencia",
+				"bomberos",
+				"firefighter"
+			]
+		}
+	},
+	"rules": [
+		{
+			"id": "SI4-GEN-EXT",
+			"check_key": "portable_extinguishers",
+			"requirement": "Extintores portátiles (en general)",
+			"applies": {
+				"type": "always"
+			},
+			"required": {
+				"type": "fixed",
+				"value": 1
+			},
+			"note": "La separación máxima de 15 m no puede verificarse automáticamente sin geometría de recorridos."
+		},
+		{
+			"id": "SI4-ADM-BIE",
+			"check_key": "fire_hose_cabinets_bie",
+			"requirement": "Bocas de incendio equipadas si superficie construida > 2.000 m²",
+			"applies": {
+				"type": "area_gt",
+				"value": 2000
+			},
+			"required": {
+				"type": "fixed",
+				"value": 1
+			},
+			"note": "Comprobación mínima por existencia de equipos BIE."
+		},
+		{
+			"id": "SI4-ADM-COL-SEC",
+			"check_key": "dry_riser",
+			"requirement": "Columna seca si altura de evacuación descendente > 24 m",
+			"applies": {
+				"type": "desc_height_gt",
+				"value": 24
+			},
+			"required": {
+				"type": "fixed",
+				"value": 1
+			},
+			"note": "En algunos municipios puede sustituirse por BIE (nota 5 de tabla)."
+		},
+		{
+			"id": "SI4-ADM-ALARM",
+			"check_key": "alarm_system",
+			"requirement": "Sistema de alarma si superficie construida > 1.000 m²",
+			"applies": {
+				"type": "area_gt",
+				"value": 1000
+			},
+			"required": {
+				"type": "fixed",
+				"value": 1
+			},
+			"note": "Debe transmitir señal visual y acústica; esa parte requiere revisión manual."
+		},
+		{
+			"id": "SI4-ADM-DET",
+			"check_key": "fire_detection",
+			"requirement": "Sistema de detección de incendio según umbral de superficie",
+			"applies": {
+				"type": "area_gt_any",
+				"values": [
+					2000,
+					5000
+				]
+			},
+			"required": {
+				"type": "fixed",
+				"value": 1
+			},
+			"note": "Si >2.000 m² se exigen detectores en zonas de riesgo alto; si >5.000 m² en todo el edificio. Cobertura exacta requiere validación espacial/manual."
+		},
+		{
+			"id": "SI4-ADM-HYD",
+			"check_key": "external_hydrants",
+			"requirement": "Hidrantes exteriores por superficie (Administrativo)",
+			"applies": {
+				"type": "area_gte",
+				"value": 5000
+			},
+			"required": {
+				"type": "hydrants_formula"
+			},
+			"note": "Pueden computarse hidrantes en vía pública a menos de 100 m (nota 3)."
+		},
+		{
+			"id": "SI4-GEN-LIFT",
+			"check_key": "emergency_elevator",
+			"requirement": "Ascensor de emergencia si altura de evacuación descendente > 28 m",
+			"applies": {
+				"type": "desc_height_gt",
+				"value": 28
+			},
+			"required": {
+				"type": "fixed",
+				"value": 1
+			},
+			"note": "Regla general de tabla 1.1."
+		},
+		{
+			"id": "SI4-GEN-AUTO-EXT",
+			"check_key": "automatic_extinguishing",
+			"requirement": "Instalación automática de extinción si altura de evacuación > 80 m",
+			"applies": {
+				"type": "desc_height_gt",
+				"value": 80
+			},
+			"required": {
+				"type": "fixed",
+				"value": 1
+			},
+			"note": "Regla general de tabla 1.1."
+		}
+	],
+	"actions_by_rule": {
+		"SI4-GEN-EXT": "Install compliant portable extinguishers (minimum efficacy 21A-113B) and place them so travel distance to an extinguisher is at most 15 m on each floor, including special-risk rooms.",
+		"SI4-ADM-BIE": "Provide at least one BIE (fire hose cabinet) because built area exceeds 2,000 m², and complete hydraulic design/commissioning according to RIPCI.",
+		"SI4-ADM-COL-SEC": "Provide a dry riser because evacuation height exceeds 24 m, unless the municipality allows the alternative system permitted by note (5).",
+		"SI4-ADM-ALARM": "Install a fire alarm system because built area exceeds 1,000 m²; ensure it provides both acoustic and visual alarm signals.",
+		"SI4-ADM-DET": "Install automatic detection: at least in high-risk rooms when area exceeds 2,000 m², and throughout the building when area exceeds 5,000 m².",
+		"SI4-ADM-HYD": "Provide the required number of external hydrants (1 between 5,000–10,000 m², plus 1 per additional 10,000 m² or fraction), or document qualifying public hydrants within 100 m.",
+		"SI4-GEN-LIFT": "Provide at least one emergency/firefighter elevator because evacuation height exceeds 28 m.",
+		"SI4-GEN-AUTO-EXT": "Provide an automatic extinguishing system because evacuation height exceeds 80 m."
+	}
+}

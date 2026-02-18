@@ -1,0 +1,99 @@
+{
+  "meta": {
+    "code": "CTE_DB_SI",
+    "section": "SI1_Propagacion_Interior",
+    "source": "DBSI.pdf"
+  },
+
+  "sector_limits_m2": {
+    "residencial_vivienda": {
+      "base_limit_m2": 2500.0,
+      "sprinkler_multiplier": 2.0,
+      "notes": [
+        "Max sector area 2500 m2.",
+        "Max areas can be doubled with automatic extinguishing system (sprinklers)."
+      ]
+    }
+  },
+
+  "special_risk_rooms": {
+    "matching": {
+      "use_fields": ["name", "long_name", "object_type", "zones"]
+    },
+
+    "types": {
+      "combustible_storage_or_archive": {
+        "keywords": [
+          "taller", "talleres",
+          "almacen", "almacén",
+          "archivo", "archivos",
+          "deposito de libros", "depósito de libros",
+          "storage", "store", "archive", "workshop",
+          "lenceria", "lencería", "limpieza"
+        ],
+        "metric": "volume_m3",
+        "thresholds": {
+          "low":   { "gt": 100.0, "lte": 200.0 },
+          "medium":{ "gt": 200.0, "lte": 400.0 },
+          "high":  { "gt": 400.0 }
+        }
+      },
+
+      "waste_storage": {
+        "keywords": ["residuos", "basura", "waste", "garbage", "trash"],
+        "metric": "area_m2",
+        "thresholds": {
+          "low":   { "gt": 5.0,  "lte": 15.0 },
+          "medium":{ "gt": 15.0, "lte": 30.0 },
+          "high":  { "gt": 30.0 }
+        }
+      },
+
+      "laundry_staff_changing": {
+        "keywords": ["lavanderia", "lavandería", "laundry", "vestuario", "vestuarios", "camerino", "camerinos"],
+        "metric": "area_m2",
+        "thresholds": {
+          "low":   { "gt": 20.0,  "lte": 100.0 },
+          "medium":{ "gt": 100.0, "lte": 200.0 },
+          "high":  { "gt": 200.0 }
+        }
+      },
+
+      "kitchen_by_power": {
+        "keywords": ["cocina", "kitchen"],
+        "metric": "power_kw",
+        "thresholds": {
+          "low":   { "gt": 20.0, "lte": 30.0 },
+          "medium":{ "gt": 30.0, "lte": 50.0 },
+          "high":  { "gt": 50.0 }
+        },
+        "data_warning_if_missing_metric": true
+      },
+
+      "boiler_room_by_power": {
+        "keywords": ["sala de calderas", "caldera", "boiler"],
+        "metric": "power_kw",
+        "thresholds": {
+          "low":   { "gt": 70.0,  "lte": 200.0 },
+          "medium":{ "gt": 200.0, "lte": 600.0 },
+          "high":  { "gt": 600.0 }
+        },
+        "data_warning_if_missing_metric": true
+      },
+
+      "always_special_risk": {
+        "keywords": [
+          "local contadores electricidad",
+          "cuadros generales",
+          "centro de transformación",
+          "transformador",
+          "switchgear",
+          "panel"
+        ],
+        "metric": "none",
+        "thresholds": null,
+        "always_special_risk": true
+      }
+    }
+  }
+}

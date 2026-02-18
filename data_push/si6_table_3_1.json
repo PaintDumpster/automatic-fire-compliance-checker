@@ -13,6 +13,18 @@
             "all": "Same requirement regardless of height"
         }
     },
+    "_defaults": {
+        "comment": "Default fire ratings (minutes) when element FireRating property is missing. Falls back to minimum required for each building use.",
+        "residential": 60,
+        "educational": 60,
+        "administrative": 60,
+        "commercial": 90,
+        "healthcare": 90,
+        "public_assembly": 90,
+        "car_park_standalone": 90,
+        "car_park_below_other": 120,
+        "single_family": 30
+    },
     "residential": {
         "basement": 120,
         "h_le_15": 60,

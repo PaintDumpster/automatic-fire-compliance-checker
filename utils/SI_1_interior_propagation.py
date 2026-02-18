@@ -1,525 +1,685 @@
-"""imported libraries
-import pandas
-import networkx
-import pydantic
-import tqdm""" 
-
-
-
-#Check all the files 
-#1.Detect all spaces (rooms)
-#1.Fire compartment identification (Sectores de incendio)
-   #A. How compartments are defined
-   #B. Sector metrics
-   #C.Sector size compliance
-
-#2.Special Risk Rooms (Locales de riesgo especial)
-   #check name, objectType or Zones 
-   #compute area and volume 
-   #check with the requirements of the code
-
-#3.Openings (Aberturas) 
-   # Doors between sectors must have specific fire resistance (EI, REI)
-   # Service penetrations must maintain fire resistance.
-   # for doors in: Special risk room - other space cehck:
-      # if the door is EI, REI or EI2h, then it is compliant
-      # if the door is not compliant, check if it has a fire damper (cortafuegos) and if it is compliant with the code.
-
-#4.Interior surface reaction-to-fire (finishes)
-   #  walls/ceilings/floors in certain areas require Euroclass reaction-to-fire ratings
-   # Read material classifications if present. If not present: data completeness warning only
-
-
-"""
-IFC Fire Safety Scanner Module (SI 1) - BASE SCANNER
-
-Purpose:
-- Provide robust, reusable extraction of IFC data needed for SI1 checks.
-- This module DOES NOT implement full SI1 regulation logic yet.
-- It extracts:
-  - Spaces (+ area, volume, storey, zones)
-  - Doors (+ fire rating if available)
-  - Walls, storeys counts
-  - Data quality metrics
-  - Errors safely (never crashes the app)
-
-Outputs are JSON-serializable dicts.
-"""
-
-
-from typing import Dict, List, Any, Optional, Tuple, Iterable
 from pathlib import Path
-
+from collections import defaultdict
+from typing import Dict, Any, Callable, Optional, List
+import re
+import json
 import ifcopenshell
 
 
-# ============================================================
-# SECTION A — SAFE HELPERS
-# ============================================================
-
-def _safe_get_attribute(element: ifcopenshell.entity_instance, attr_name: str) -> Optional[Any]:
-    """Safely retrieve an attribute from an IFC element."""
-    try:
-        if hasattr(element, attr_name):
-            return getattr(element, attr_name)
-    except Exception:
-        pass
-    return None
+DEFAULT_RULES_CONFIG_PATH = Path(
+    r"C:\Users\gorkem\Documents\GitHub\automatic-fire-compliance-checker\00_data\config\rulesdb_si_si1_rules.json"
+)
 
 
-def get_pset_value(
-    element: ifcopenshell.entity_instance,
-    pset_name: str,
-    prop_name: str
-) -> Optional[Any]:
+def load_rules_config(path: str) -> Dict[str, Any]:
     """
-    Safely retrieve a property value from an element's property set.
-    Uses ifcopenshell.util.element.get_psets when available.
+    Load SI1 rules configuration from a JSON file.
+
+    The JSON is expected to contain at least:
+      - project_defaults: { building_use, sprinklers, ... }
+      - sector_area_limits_m2: { <building_use>: { ... } or number }
     """
     try:
-        from ifcopenshell.util.element import get_psets  # type: ignore
-        psets = get_psets(element) or {}
-        pset = psets.get(pset_name, None)
-        if isinstance(pset, dict):
-            return pset.get(prop_name, None)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        pass
-    return None
+        # Robust fallback: return empty dict; callers must handle INCOMPLETE
+        return {}
 
 
-def _to_float(x: Any) -> Optional[float]:
-    """Best-effort float conversion."""
+# ---------- helpers ----------
+def safe_attr(el, name, default=None):
     try:
-        if x is None:
+        return getattr(el, name)
+    except Exception:
+        return default
+
+def build_storey_map(ifc):
+    m = {}
+
+    # 1) RelContainedInSpatialStructure (often for elements)
+    for rel in ifc.by_type("IfcRelContainedInSpatialStructure") or []:
+        container = rel.RelatingStructure
+        if container and container.is_a("IfcBuildingStorey"):
+            sname = getattr(container, "Name", None) or "Unknown"
+            for el in rel.RelatedElements or []:
+                m[el.id()] = sname
+
+    # 2) RelAggregates (often for spaces)
+    for rel in ifc.by_type("IfcRelAggregates") or []:
+        parent = rel.RelatingObject
+        if parent and parent.is_a("IfcBuildingStorey"):
+            sname = getattr(parent, "Name", None) or "Unknown"
+            for child in rel.RelatedObjects or []:
+                # some exporters aggregate spaces here
+                m[child.id()] = sname
+
+    return m
+
+def get_psets(el):
+    try:
+        from ifcopenshell.util.element import get_psets
+        return get_psets(el) or {}
+    except Exception:
+        return {}
+
+
+def _area_from_geometry_bbox(space) -> Optional[float]:
+    """
+    Very rough geometric fallback: compute 2D bounding-box area of the space
+    using ifcopenshell.geom. This is only used when no quantity/pset area is
+    available and should be treated as an approximation.
+    """
+    try:
+        import ifcopenshell.geom as geom  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        settings = geom.settings()
+        shape = geom.create_shape(settings, space)
+        verts = shape.geometry.verts  # flat list [x1,y1,z1,x2,y2,z2,...]
+        if not verts:
             return None
-        return float(x)
+
+        xs = verts[0::3]
+        ys = verts[1::3]
+        if not xs or not ys:
+            return None
+
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        area = (maxx - minx) * (maxy - miny)
+        if area <= 0:
+            return None
+        return float(area)
     except Exception:
         return None
 
-#2.Special Risk Rooms (Locales de riesgo especial)
-import re
-from typing import Dict, Any, List, Optional, Tuple
 
-# Map: detected_type -> keywords (spanish + english + some common variants)
-RISK_KEYWORDS = {
-    "electrical_room": [
-        "cuarto electrico", "cuarto eléctrico", "sala electrica", "sala eléctrica",
-        "electric", "electrical", "elec", "switchgear", "panel", "mv", "lv"
-    ],
-    "boiler_room": [
-        "caldera", "sala de calderas", "boiler", "plant room", "mechanical room"
-    ],
-    "laundry": [
-        "lavanderia", "lavandería", "laundry"
-    ],
-    "storage": [
-        "almacen", "almacén", "trastero", "storage", "store", "deposito", "depósito"
-    ],
-    "kitchen": [
-        "cocina", "kitchen"
-    ],
-    "waste_room": [
-        "basura", "residuos", "waste", "garbage", "trash"
-    ],
-    "garage": [
-        "garaje", "garage", "parking", "aparcamiento"
-    ]
-}
-
-def _norm(s: Optional[str]) -> str:
-    return (s or "").strip().lower()
-
-def _collect_space_text(space: Dict[str, Any]) -> str:
-    """Combine name/object_type/long_name/zones into one searchable text."""
-    parts = [
-        _norm(space.get("name")),
-        _norm(space.get("long_name")),
-        _norm(space.get("object_type")),
-    ]
-    zones = space.get("zones") or []
-    parts.extend([_norm(z) for z in zones])
-    return " | ".join([p for p in parts if p])
-
-def detect_risk_room_type(space: Dict[str, Any]) -> Tuple[Optional[str], float, List[str]]:
+def get_space_area(space):
     """
+    Best-effort area extraction for a space.
+
     Returns:
-      (detected_type, confidence, matched_keywords)
+        (area_m2: Optional[float], method: str, warning: Optional[str])
+
+    method:
+        'quantity'  - from IfcElementQuantity
+        'pset'      - from common psets (Pset_SpaceCommon, BaseQuantities, ...)
+        'geom'      - from geometry bounding box (approximate)
+        'none'      - no area available
     """
-    text = _collect_space_text(space)
-    if not text:
-        return None, 0.0, []
-
-    best_type = None
-    best_score = 0.0
-    best_matches: List[str] = []
-
-    for room_type, keywords in RISK_KEYWORDS.items():
-        matches = []
-        for kw in keywords:
-            if kw in text:
-                matches.append(kw)
-
-        if matches:
-            # simple confidence: more keyword hits => higher confidence
-            score = min(1.0, 0.3 + 0.2 * len(matches))
-            if score > best_score:
-                best_score = score
-                best_type = room_type
-                best_matches = matches
-
-    return best_type, best_score, best_matches
-risk_result = check_special_risk_rooms(scan["spaces"])
-
-print(json.dumps(risk_result, indent=2))
-
-
-# ============================================================
-# SECTION B — STOREY LOOKUP (FAST)
-# ============================================================
-
-def build_element_storey_map(ifc_file: ifcopenshell.file) -> Dict[int, str]:
-    """
-    Build a fast map { element_id_int : storey_name } using IfcRelContainedInSpatialStructure.
-    Avoids scanning all relations per element (performance fix for big IFCs).
-    """
-    mapping: Dict[int, str] = {}
+    # 1) quantities
     try:
-        rels = ifc_file.by_type("IfcRelContainedInSpatialStructure") or []
-        for rel in rels:
-            container = getattr(rel, "RelatingStructure", None)
-            if not container or not container.is_a("IfcBuildingStorey"):
-                continue
-            storey_name = getattr(container, "Name", None) or "Unknown"
-            related = getattr(rel, "RelatedElements", None) or []
-            for el in related:
-                try:
-                    mapping[el.id()] = storey_name
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return mapping
-
-
-def get_storey_name(element: ifcopenshell.entity_instance, storey_map: Dict[int, str]) -> Optional[str]:
-    """Get storey name from cached map."""
-    try:
-        return storey_map.get(element.id(), None)
-    except Exception:
-        return None
-
-
-# ============================================================
-# SECTION C — QUANTITIES (AREA/VOLUME) THAT ACTUALLY WORK
-# ============================================================
-
-def get_element_quantities(element: ifcopenshell.entity_instance) -> Dict[str, float]:
-    """
-    Extract quantities (IfcElementQuantity) from IsDefinedBy relations.
-
-    Returns dict keyed by quantity Name lowercased:
-      - IfcQuantityArea  -> AreaValue
-      - IfcQuantityVolume -> VolumeValue
-    """
-    out: Dict[str, float] = {}
-    try:
-        for rel in getattr(element, "IsDefinedBy", []) or []:
+        for rel in space.IsDefinedBy or []:
             if not rel.is_a("IfcRelDefinesByProperties"):
                 continue
-            prop_def = getattr(rel, "RelatingPropertyDefinition", None)
-            if not prop_def or not prop_def.is_a("IfcElementQuantity"):
-                continue
-            for q in getattr(prop_def, "Quantities", []) or []:
-                qname = (getattr(q, "Name", "") or "").strip().lower()
-                if not qname:
-                    continue
-                if q.is_a("IfcQuantityArea"):
-                    val = _to_float(getattr(q, "AreaValue", None))
-                    if val is not None:
-                        out[qname] = val
-                elif q.is_a("IfcQuantityVolume"):
-                    val = _to_float(getattr(q, "VolumeValue", None))
-                    if val is not None:
-                        out[qname] = val
+            qset = rel.RelatingPropertyDefinition
+            if qset and qset.is_a("IfcElementQuantity"):
+                for q in qset.Quantities or []:
+                    if q.is_a("IfcQuantityArea") and hasattr(q, "AreaValue"):
+                        return float(q.AreaValue), "quantity", None
     except Exception:
         pass
-    return out
+
+    # 2) psets common
+    p = get_psets(space)
+    for pset_name in ("Pset_SpaceCommon", "BaseQuantities", "Qto_SpaceBaseQuantities"):
+        d = p.get(pset_name, {})
+        if not isinstance(d, dict):
+            continue
+        for key in ("NetFloorArea", "GrossFloorArea", "Area"):
+            if key in d and d[key] is not None:
+                try:
+                    return float(d[key]), "pset", None
+                except Exception:
+                    pass
+
+    # 3) fallback: geometry-based approximation (bounding box)
+    geom_area = _area_from_geometry_bbox(space)
+    if geom_area is not None:
+        return geom_area, "geom", "Area approximated from geometry bounding box; verify against model."
+
+    # 4) no area
+    return None, "none", None
+
+def get_space_zones(space):
+    zones = []
+    for rel in getattr(space, "HasAssignments", []) or []:
+        if rel.is_a("IfcRelAssignsToGroup"):
+            grp = rel.RelatingGroup
+            if grp and grp.is_a("IfcZone"):
+                zones.append(safe_attr(grp, "Name", "UnnamedZone") or "UnnamedZone")
+    return zones
 
 
-def get_space_area_m2(space: ifcopenshell.entity_instance) -> Optional[float]:
-    qs = get_element_quantities(space)
-    # Common IFC names (varies by exporter)
-    candidates = (
-        "netfloorarea", "grossfloorarea", "area",
-        "net area", "gross area", "floorarea", "floor area"
-    )
-    for k in candidates:
-        if k in qs:
-            return qs[k]
-    return None
+def _norm_text(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+DEFAULT_SECTOR = "SECTOR_1"
 
 
-def get_space_volume_m3(space: ifcopenshell.entity_instance) -> Optional[float]:
-    qs = get_element_quantities(space)
-    candidates = ("netvolume", "grossvolume", "volume", "spacevolume", "space volume")
-    for k in candidates:
-        if k in qs:
-            return qs[k]
-    return None
-
-
-# ============================================================
-# SECTION D — ZONES (IfcZone membership)
-# ============================================================
-
-def get_space_zones(space: ifcopenshell.entity_instance) -> List[str]:
+def get_sector_id(space):
     """
-    Get zone names for a space via IfcRelAssignsToGroup where group is IfcZone.
+    Determine fire sector / compartment ID for a space.
+
+    Priority:
+      1) IfcZone membership
+      2) Property set value on space (FireCompartment / Sector / SI_Sector...)
+      3) Regex on Name / LongName / ObjectType
+      4) Fallback single sector
+
+    Returns:
+      (sector_id: str, method: str)
     """
-    zones: List[str] = []
+    # 1) IfcZone membership (strongest)
     try:
         for rel in getattr(space, "HasAssignments", []) or []:
             if not rel.is_a("IfcRelAssignsToGroup"):
                 continue
-            grp = getattr(rel, "RelatingGroup", None)
+            grp = rel.RelatingGroup
             if grp and grp.is_a("IfcZone"):
-                zname = getattr(grp, "Name", None) or getattr(grp, "LongName", None) or "UnnamedZone"
-                zones.append(str(zname))
+                zname = safe_attr(grp, "Name") or safe_attr(grp, "LongName")
+                label = (zname or "").strip()
+                if label:
+                    return label, "zone:IfcZone"
     except Exception:
         pass
-    return zones
 
-# ============================================================
-# SECTION E — DOOR FIRE RATING (INSTANCE + TYPE, ROBUST)
-# ============================================================
-
-def _extract_fire_rating_from_pset(element) -> Optional[str]:
-    """
-    Extract FireRating from an IfcPropertySet manually,
-    ensuring we read NominalValue correctly.
-    """
+    # 2) Property set on space
     try:
-        for rel in getattr(element, "IsDefinedBy", []) or []:
-            if not rel.is_a("IfcRelDefinesByProperties"):
+        psets = get_psets(space)
+        # Keys we consider as potential sector identifiers
+        sector_keys = {
+            "firecompartment",
+            "fire_compartment",
+            "firecompartmentid",
+            "fire_sector",
+            "firesector",
+            "sector",
+            "si_sector",
+            "compartment",
+        }
+        for pset_name, props in psets.items():
+            if not isinstance(props, dict):
                 continue
-
-            pset = getattr(rel, "RelatingPropertyDefinition", None)
-            if not pset or not pset.is_a("IfcPropertySet"):
-                continue
-
-            if pset.Name != "Pset_DoorCommon":
-                continue
-
-            for prop in getattr(pset, "HasProperties", []) or []:
-                if prop.Name == "FireRating":
-                    if hasattr(prop, "NominalValue") and prop.NominalValue:
-                        value = prop.NominalValue.wrappedValue
-                        # Filter useless placeholder values
-                        if value and str(value).strip().lower() not in ["fire rating", "none", ""]:
-                            return str(value).strip()
+            for key, value in props.items():
+                if value is None:
+                    continue
+                key_l = str(key).lower()
+                if key_l in sector_keys:
+                    label = str(value).strip()
+                    if label:
+                        return label, f"pset:{pset_name}.{key}"
     except Exception:
         pass
 
-    return None
+    # 3) Regex on name / object type / long name
+    try:
+        texts = [
+            safe_attr(space, "Name") or "",
+            safe_attr(space, "LongName") or "",
+            safe_attr(space, "ObjectType") or "",
+        ]
+        combined = " ".join(t for t in texts if t)
+        if combined:
+            patterns = [
+                r"\b[Ss]ector\s*[A-Za-z0-9_-]+",   # "Sector 1", "sector A", "Sector-01"
+                r"\bSC[-_ ]?[A-Za-z0-9]+",         # "SC-01", "SC_1"
+                r"\bSEC[-_ ]?[A-Za-z0-9]+",        # "SEC-1"
+            ]
+            for pat in patterns:
+                m = re.search(pat, combined)
+                if m:
+                    label = m.group(0).strip()
+                    if label:
+                        return label, f"name_regex:{pat}"
+    except Exception:
+        pass
+
+    # 4) Fallback: single sector for whole building
+    return DEFAULT_SECTOR, "fallback:single_sector"
 
 
-def get_door_fire_rating(door) -> Optional[str]:
+# ============================================================
+# Special Risk Rooms (Locales de riesgo especial)
+# ============================================================
+
+def check_special_risk_rooms(spaces: List[Dict[str, Any]], rules: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Retrieve fire rating from:
-    1. Door instance property set
-    2. Door type property set (IfcRelDefinesByType)
+    Detect and classify special risk rooms based on configuration.
+
+    Configuration (in rules JSON):
+
+    special_risk_rooms: {
+      "keywords": {
+        "<risk_type>": ["kw1", "kw2", ...] | { "keywords": [...] }
+      },
+      "thresholds": {
+        "<risk_type>": {
+          "area_m2": {
+            "low": <float>,
+            "medium": <float>,
+            "high": <float>
+          }
+        }
+      }
+    }
 
     Returns:
-        Fire rating string (e.g. "EI60", "REI90") or None
+        {
+          "result": "PASS" | "FAIL" | "INCOMPLETE",
+          "color": "green" | "red" | "yellow",
+          "details": {
+            "detected_count": int,
+            "items": [...],
+          },
+        }
     """
+    sr_cfg = rules.get("special_risk_rooms") or {}
+    keywords_cfg = sr_cfg.get("keywords") or {}
+    thresholds_cfg = sr_cfg.get("thresholds") or {}
 
-    # 1️⃣ Check instance property set
-    fr = _extract_fire_rating_from_pset(door)
-    if fr:
-        return fr
-
-    # 2️⃣ Check type property set
-    try:
-        for rel in getattr(door, "IsDefinedBy", []) or []:
-            if rel.is_a("IfcRelDefinesByType"):
-                door_type = getattr(rel, "RelatingType", None)
-                if door_type:
-                    fr_type = _extract_fire_rating_from_pset(door_type)
-                    if fr_type:
-                        return fr_type
-    except Exception:
-        pass
-
-    return None
-
-
-# ============================================================
-# SECTION F — MAIN SCAN API
-# ============================================================
-
-def scan_ifc_basic(ifc_path: str, preview_limit: int = 20) -> Dict[str, Any]:
-    """
-    Scan an IFC file and extract basic fire-safety relevant information.
-
-    Returns JSON-serializable dict:
-    - file_name
-    - counts: IfcSpace, IfcDoor, IfcWall, IfcBuildingStorey
-    - spaces: first N spaces with guid, name, long_name, object_type, storey_name, area_m2, volume_m3, zones
-    - doors: first N doors with guid, name, predefined_type, fire_rating
-    - data_quality flags
-    - error (optional)
-    """
-    file_name = Path(ifc_path).name if ifc_path else "unknown"
-
-    # Open IFC safely
-    try:
-        ifc_file = ifcopenshell.open(ifc_path)
-    except Exception as e:
+    # If no config for special risk rooms, treat as INCOMPLETE
+    if not keywords_cfg:
         return {
-            "file_name": file_name,
-            "error": f"Failed to open IFC file: {e}",
-            "spaces": [],
-            "doors": [],
-            "counts": {"IfcSpace": 0, "IfcDoor": 0, "IfcWall": 0, "IfcBuildingStorey": 0},
-            "data_quality": {
-                "has_spaces": False,
-                "has_storeys": False,
-                "has_space_areas": False,
-                "has_space_volumes": False,
-                "has_fire_ratings_doors": False,
-                "has_zones": False,
+            "result": "INCOMPLETE",
+            "color": "yellow",
+            "details": {
+                "detected_count": 0,
+                "items": [],
+                "messages": ["No special_risk_rooms.keywords configured."],
             },
         }
 
-    try:
-        spaces = ifc_file.by_type("IfcSpace") or []
-        doors = ifc_file.by_type("IfcDoor") or []
-        walls = ifc_file.by_type("IfcWall") or []
-        storeys = ifc_file.by_type("IfcBuildingStorey") or []
+    items: List[Dict[str, Any]] = []
+    any_missing_area_or_volume = False
+    any_high_risk = False
 
-        storey_map = build_element_storey_map(ifc_file)
+    for sp in spaces:
+        # Collect searchable text
+        name = sp.get("name") or ""
+        long_name = sp.get("long_name") or ""
+        object_type = sp.get("object_type") or ""
+        zones = sp.get("zones") or []
 
-        # ---- Spaces preview ----
-        space_list: List[Dict[str, Any]] = []
-        has_area = False
-        has_volume = False
-        has_zone = False
+        parts = [
+            _norm_text(name),
+            _norm_text(long_name),
+            _norm_text(object_type),
+        ]
+        parts.extend(_norm_text(z) for z in zones if z)
+        text = " | ".join(p for p in parts if p)
+        if not text:
+            continue
 
-        for space in spaces[:preview_limit]:
-            area = get_space_area_m2(space)
-            vol = get_space_volume_m3(space)
-            zones = get_space_zones(space)
+        detected_type: Optional[str] = None
+        matched_keywords: List[str] = []
 
-            if area is not None:
-                has_area = True
-            if vol is not None:
-                has_volume = True
-            if zones:
-                has_zone = True
+        # Keyword matching, fully driven by config
+        for risk_type, kw_cfg in keywords_cfg.items():
+            if isinstance(kw_cfg, dict):
+                kw_list = kw_cfg.get("keywords", [])
+            else:
+                kw_list = kw_cfg
 
-            space_list.append({
-                "guid": _safe_get_attribute(space, "GlobalId"),
-                "name": _safe_get_attribute(space, "Name") or "Unnamed",
-                "long_name": _safe_get_attribute(space, "LongName"),
-                "object_type": _safe_get_attribute(space, "ObjectType"),
-                "storey_name": get_storey_name(space, storey_map),
-                "area_m2": area,
-                "volume_m3": vol,
-                "zones": zones
+            local_matches: List[str] = []
+            for kw in kw_list or []:
+                kw_norm = _norm_text(str(kw))
+                if not kw_norm:
+                    continue
+                if kw_norm in text:
+                    local_matches.append(str(kw))
+
+            if local_matches:
+                detected_type = risk_type
+                matched_keywords = local_matches
+                # First matching type wins; can be adjusted if needed
+                break
+
+        if not detected_type:
+            continue
+
+        area_m2 = sp.get("area_m2")
+        volume_m3 = sp.get("volume_m3")
+        storey = sp.get("storey")
+
+        # Track missing metrics for INCOMPLETE decision
+        if area_m2 is None or volume_m3 is None:
+            any_missing_area_or_volume = True
+
+        # Risk classification (LOW / MEDIUM / HIGH / UNKNOWN)
+        risk_level = "UNKNOWN"
+        area_value: Optional[float] = None
+        try:
+            if area_m2 is not None:
+                area_value = float(area_m2)
+        except Exception:
+            area_value = None
+
+        th_type = thresholds_cfg.get(detected_type, {})
+        area_th = th_type.get("area_m2", {}) if isinstance(th_type, dict) else {}
+
+        if area_value is not None and area_th:
+            low_t = area_th.get("low")
+            med_t = area_th.get("medium")
+            high_t = area_th.get("high")
+
+            try:
+                if high_t is not None and area_value > float(high_t):
+                    risk_level = "HIGH"
+                elif med_t is not None and area_value > float(med_t):
+                    risk_level = "MEDIUM"
+                elif low_t is not None and area_value >= float(low_t):
+                    risk_level = "LOW"
+                else:
+                    # thresholds exist but area is below lowest; treat as LOW by default
+                    risk_level = "LOW"
+            except Exception:
+                risk_level = "UNKNOWN"
+        elif area_value is not None and not area_th:
+            # Area known but no thresholds configured for this type
+            risk_level = "UNKNOWN"
+
+        if risk_level == "HIGH":
+            any_high_risk = True
+
+        items.append({
+            "guid": sp.get("guid"),
+            "name": name,
+            "long_name": long_name,
+            "object_type": object_type,
+            "storey": storey,
+            "zones": zones,
+            "detected_type": detected_type,
+            "matched_keywords": matched_keywords,
+            "area_m2": area_m2,
+            "volume_m3": volume_m3,
+            "risk_level": risk_level,
+        })
+
+    detected_count = len(items)
+
+    # Determine result & color
+    if detected_count == 0:
+        result = "PASS"
+        color = "green"
+    else:
+        if any_high_risk:
+            result = "FAIL"
+            color = "red"
+        elif any_missing_area_or_volume:
+            result = "INCOMPLETE"
+            color = "yellow"
+        else:
+            result = "PASS"
+            color = "green"
+
+    return {
+        "result": result,
+        "color": color,
+        "details": {
+            "detected_count": detected_count,
+            "items": items,
+        },
+    }
+# ---------- core ----------
+def scan_one_ifc(ifc_path: str, exclude_space_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None):
+    ifc = ifcopenshell.open(ifc_path)
+
+    storey_map = build_storey_map(ifc)
+    spaces = ifc.by_type("IfcSpace") or []
+
+    space_rows = []
+    sector_map = {}
+    sector_method = {}
+
+    for sp in spaces:
+        sid, method = get_sector_id(sp)
+        sector_map[sp.id()] = sid
+        sector_method[sp.id()] = method
+
+        area, area_method, area_warning = get_space_area(sp)
+
+        space_rows.append({
+            "guid": safe_attr(sp, "GlobalId"),
+            "name": safe_attr(sp, "Name") or "Unnamed",
+            "storey": storey_map.get(sp.id()),
+            "area_m2": area,
+            "area_method": area_method,
+            "area_warning": area_warning,
+            "sector": sid,
+            "sector_method": method,
+            "zones": get_space_zones(sp),
+        })
+
+    # sector metrics
+    sector_stats = defaultdict(lambda: {
+        "area_total": 0.0,
+        "spaces": 0,
+        "missing_area_spaces": 0,
+        "excluded_spaces": 0,
+        "by_storey": defaultdict(float),
+    })
+
+    for r in space_rows:
+        s = r["sector"]
+        stat = sector_stats[s]
+        stat["spaces"] += 1
+
+        excluded = False
+        if exclude_space_predicate is not None:
+            try:
+                excluded = bool(exclude_space_predicate(r))
+            except Exception:
+                excluded = False
+        r["excluded_from_sector_area"] = excluded
+
+        if excluded:
+            stat["excluded_spaces"] += 1
+            continue
+
+        a = r["area_m2"]
+        if a is None:
+            stat["missing_area_spaces"] += 1
+        else:
+            stat["area_total"] += a
+            if r["storey"]:
+                stat["by_storey"][r["storey"]] += a
+
+    # ---------- Convert sector stats to normal dict ----------
+    sector_stats_out = {}
+    for s, v in sector_stats.items():
+        sector_stats_out[s] = {
+            "spaces": v["spaces"],
+            "area_total": v["area_total"],
+            "missing_area_spaces": v["missing_area_spaces"],
+            "by_storey": dict(v["by_storey"])
+        }
+
+    # ---------- Sector Size Compliance + Special Risk Rooms ----------
+    rules = load_rules_config(str(DEFAULT_RULES_CONFIG_PATH))
+    sector_size_result = check_sector_size_compliance(sector_stats_out, rules)
+    special_risk_result = check_special_risk_rooms(space_rows, rules)
+
+    # ---------- Final Output ----------
+    return {
+        "file": Path(ifc_path).name,
+        "path": ifc_path,
+
+        "counts": {
+            "IfcSpace": len(spaces),
+            "IfcDoor": len(ifc.by_type("IfcDoor") or []),
+            "IfcWall": len(ifc.by_type("IfcWall") or []),
+            "IfcBuildingStorey": len(ifc.by_type("IfcBuildingStorey") or []),
+        },
+
+        "data_quality": {
+            "has_spaces": len(spaces) > 0,
+            "has_any_space_area": any(r["area_m2"] is not None for r in space_rows),
+
+            # real sector labels only (not fallback)
+            "has_sector_labels": any(
+                r["sector_method"] != "fallback:single_sector"
+                for r in space_rows
+            ),
+
+            "used_sector_fallback": any(
+                r["sector_method"] == "fallback:single_sector"
+                for r in space_rows
+            ),
+        },
+
+        "spaces": space_rows,
+        "spaces_preview": space_rows[:20],
+        "sectors": sector_stats_out,
+
+        #  SI1 compliance result
+        "si1_sector_size": sector_size_result,
+        "si1_special_risk_rooms": special_risk_result,
+    }
+
+
+def check_sector_size_compliance(sectors: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Check each sector's total area against a DB-SI style limit loaded from config.
+
+    The `rules` dict is expected to contain:
+      - project_defaults: { building_use, sprinklers, ... }
+      - sector_area_limits_m2: { <building_use>: number | { base_limit_m2, allow_double_if_sprinklers, ... } }
+
+    Returns:
+        {
+            "result": "PASS" | "FAIL" | "INCOMPLETE",
+            "color": "green" | "red" | "yellow",
+            "details": {...}
+        }
+    """
+    project_defaults = rules.get("project_defaults") or {}
+    sector_limits_cfg = rules.get("sector_area_limits_m2") or {}
+
+    building_use = project_defaults.get("building_use")
+    sprinklers = bool(project_defaults.get("sprinklers", False))
+
+    messages: list[str] = []
+
+    if not building_use:
+        messages.append("Missing project_defaults.building_use in rules configuration.")
+
+    # Determine base limit and allow_double_if_sprinklers
+    base_limit: Optional[float] = None
+    allow_double = False
+
+    if building_use and building_use in sector_limits_cfg:
+        cfg_entry = sector_limits_cfg[building_use]
+        if isinstance(cfg_entry, (int, float)):
+            base_limit = float(cfg_entry)
+            allow_double = bool(
+                rules.get("allow_double_if_sprinklers")
+                or project_defaults.get("allow_double_if_sprinklers")
+            )
+        elif isinstance(cfg_entry, dict):
+            # Try multiple common keys to avoid hard-coding one schema
+            for key in ("base_limit_m2", "limit_m2", "base", "limit"):
+                if key in cfg_entry and cfg_entry[key] is not None:
+                    try:
+                        base_limit = float(cfg_entry[key])
+                        break
+                    except Exception:
+                        continue
+            allow_double = bool(
+                cfg_entry.get("allow_double_if_sprinklers")
+                or rules.get("allow_double_if_sprinklers")
+                or project_defaults.get("allow_double_if_sprinklers")
+            )
+    else:
+        if building_use:
+            messages.append(
+                f"No sector_area_limits_m2 entry for building_use='{building_use}'."
+            )
+
+    if base_limit is None:
+        messages.append("No usable base sector area limit found in configuration.")
+
+    effective_limit: Optional[float] = None
+    if base_limit is not None:
+        effective_limit = base_limit
+        if sprinklers and allow_double:
+            effective_limit = base_limit * 2.0
+
+    per_sector = []
+    any_fail = False
+    any_incomplete = False
+
+    for sector_id, sdata in sectors.items():
+        area = sdata.get("area_total")
+        if area is None or effective_limit is None:
+            any_incomplete = True
+            per_sector.append({
+                "sector": sector_id,
+                "area_total_m2": area,
+                "limit_m2": effective_limit,
+                "status": "INCOMPLETE",
+                "reason": "Missing area_total or effective_limit_m2.",
             })
+            continue
 
-        # ---- Doors preview ----
-        door_list: List[Dict[str, Any]] = []
-        fire_rating_count = 0
+        is_ok = area <= effective_limit
+        if not is_ok:
+            any_fail = True
 
-        for door in doors[:preview_limit]:
-            fire_rating = get_door_fire_rating(door)
-            if fire_rating is not None:
-                fire_rating_count += 1
+        per_sector.append({
+            "sector": sector_id,
+            "area_total_m2": area,
+            "limit_m2": effective_limit,
+            "status": "PASS" if is_ok else "FAIL",
+        })
 
-            door_list.append({
-                "guid": _safe_get_attribute(door, "GlobalId"),
-                "name": _safe_get_attribute(door, "Name") or "Unnamed",
-                "predefined_type": _safe_get_attribute(door, "PredefinedType") or "Unknown",
-                "fire_rating": fire_rating
-            })
+    # Determine overall result/color
+    if any_fail:
+        result = "FAIL"
+        color = "red"
+    elif any_incomplete or base_limit is None or building_use is None:
+        result = "INCOMPLETE"
+        color = "yellow"
+    else:
+        result = "PASS"
+        color = "green"
 
-        return {
-            "file_name": file_name,
-            "spaces": space_list,
-            "doors": door_list,
-            "counts": {
-                "IfcSpace": len(spaces),
-                "IfcDoor": len(doors),
-                "IfcWall": len(walls),
-                "IfcBuildingStorey": len(storeys),
-            },
-            "data_quality": {
-                "has_spaces": len(spaces) > 0,
-                "has_storeys": len(storeys) > 0,
-                "has_space_areas": has_area,
-                "has_space_volumes": has_volume,
-                "has_fire_ratings_doors": fire_rating_count > 0,
-                "has_zones": has_zone,
-            },
-        }
+    details: Dict[str, Any] = {
+        "building_use": building_use,
+        "sprinklers": sprinklers,
+        "base_limit_m2": base_limit,
+        "effective_limit_m2": effective_limit,
+        "allow_double_if_sprinklers": allow_double,
+        "sector_checks": per_sector,
+    }
+    if messages:
+        details["messages"] = messages
 
-    except Exception as e:
-        return {
-            "file_name": file_name,
-            "error": f"Error scanning IFC file: {e}",
-            "spaces": [],
-            "doors": [],
-            "counts": {"IfcSpace": 0, "IfcDoor": 0, "IfcWall": 0, "IfcBuildingStorey": 0},
-            "data_quality": {
-                "has_spaces": False,
-                "has_storeys": False,
-                "has_space_areas": False,
-                "has_space_volumes": False,
-                "has_fire_ratings_doors": False,
-                "has_zones": False,
-            },
-        }
+    return {
+        "result": result,
+        "color": color,
+        "details": details,
+    }
 
-
-# ============================================================
-# SECTION G — BATCH SCAN (CHECK ALL FILES)
-# ============================================================
-
-def scan_ifc_folder(folder_path: str, recursive: bool = True, preview_limit: int = 20) -> Dict[str, Any]:
-    """
-    Scan all IFC files in a folder.
-    """
+def scan_folder(folder_path: str, recursive: bool = True):
     folder = Path(folder_path)
     pattern = "**/*.ifc" if recursive else "*.ifc"
     files = sorted(folder.glob(pattern))
 
-    results: List[Dict[str, Any]] = []
-    pass_count = 0
-    fail_count = 0
-
+    results = []
     for f in files:
-        r = scan_ifc_basic(str(f), preview_limit=preview_limit)
-        results.append(r)
-        if "error" in r:
-            fail_count += 1
-        else:
-            pass_count += 1
+        try:
+            results.append(scan_one_ifc(str(f)))
+        except Exception as e:
+            results.append({"file": f.name, "path": str(f), "error": str(e)})
 
-    return {
-        "batch": True,
-        "folder": str(folder),
-        "files_checked": len(files),
-        "results": results,
-        "stats": {"PASS": pass_count, "FAIL": fail_count}
-    }
-
+    return {"folder": str(folder), "files_checked": len(files), "results": results}
 
 if __name__ == "__main__":
-    # ✅ Hardcode folder here (use raw string OR forward slashes)
-    folder_path = r"C:\Users\gorkem\Documents\GitHub\automatic-fire-compliance-checker\00_data\ifc_models"
-
-    batch = scan_ifc_folder(folder_path, recursive=True, preview_limit=5)
-
     import json
-    print(json.dumps(batch, indent=2))
+    folder_path = r"C:\Users\gorkem\Documents\GitHub\automatic-fire-compliance-checker\00_data\ifc_models"
+    out = scan_folder(folder_path, recursive=True)
+    print(json.dumps(out, indent=2))

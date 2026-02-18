@@ -1,9 +1,10 @@
 # ─────────────────────────────────────────────
 # IMPORTED LIBRARIES
 # ─────────────────────────────────────────────
-import json
-import os
-import ifcopenshell
+import json # for loading SI 6 Table 3.1 data from external JSON file
+import os # for file path handling
+import ifcopenshell # for reading IFC files and extracting element properties
+import logging # for debug logging throughout the module
 
 
 # ─────────────────────────────────────────────
@@ -11,17 +12,169 @@ import ifcopenshell
 # ─────────────────────────────────────────────
 
 # Load SI 6 Table 3.1 from external JSON file
-# The JSON file should be in the same directory as this script
-_JSON_PATH = "data_push/si6_table_3_1.json"
+# Compute path relative to this module for reliability when imported
+_JSON_PATH = os.path.join(os.path.dirname(__file__), "..", "data_push", "si6_table_3_1.json")
+_JSON_PATH = os.path.abspath(_JSON_PATH)
 
-with open(_JSON_PATH, "r") as f:
+with open(_JSON_PATH, "r", encoding="utf-8") as f:
     _SI6_DATA = json.load(f)
 
 SI6_TABLE_3_1 = {
     key: value
     for key, value in _SI6_DATA.items()
-    if not key.startswith("_")        # skip metadata keys
+    if not key.startswith("_")
 }
+
+# Logger for this module
+logger = logging.getLogger(__name__)
+logger.debug("Loaded SI6_TABLE_3_1 keys: %s", list(SI6_TABLE_3_1.keys()))
+
+
+# Multilingual mapping for building-use detection (English + Spanish)
+BUILDING_USE_MAP = {
+    "residential": ["residential", "residencial", "vivienda", "single_family", "single-family", "unifamiliar"],
+    "commercial": ["commercial", "comercial", "comercio", "retail"],
+    "office": ["office", "oficina", "oficinas"],
+    "public_assembly": ["public assembly", "ensamblaje público", "uso público", "publico", "auditorium", "auditorio"],
+    "healthcare": ["healthcare", "sanitary", "sanitario", "salud", "hospital"],
+    "educational": ["educational", "educativo", "educación", "escuela", "school"],
+    "administrative": ["administrative", "administrativo"],
+    "car_park_standalone": ["car park", "parking", "aparcamientos", "estacionamiento"],
+    "car_park_below_other": ["car park below", "parking below", "aparcamientos bajo"],
+    "single_family": ["single family", "vivienda unifamiliar", "single-family"]
+}
+
+
+FIRE_RATING_FIELD_VARIANTS = [
+    "firerating",
+    "fire_rating",
+    "fire rating",
+    "resistencia_fuego",
+    "resistenciafuego",
+    "resistencia_de_fuego",
+    "resistencia",
+]
+
+import re
+
+
+def _match_building_use(text):
+    if not text:
+        return None
+    t = text.strip().lower()
+    for key, variants in BUILDING_USE_MAP.items():
+        for v in variants:
+            if v in t:
+                logger.debug("Matched building use '%s' -> '%s' (source: %s)", v, key, text)
+                return key
+    return None
+
+
+def _normalize_prop_name(name):
+    if not name:
+        return ""
+    return name.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _parse_minutes_from_value(val):
+    try:
+        s = str(val)
+    except Exception:
+        return None
+    # Look for R90 style or just digits
+    m = re.search(r"R\s*(\d{1,3})", s, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m2 = re.search(r"(\d{1,3})\s*(min|minutes)?", s, re.IGNORECASE)
+    if m2:
+        return int(m2.group(1))
+    # Last resort: extract any digits
+    digits = ''.join(filter(str.isdigit, s))
+    if digits:
+        logger.debug("Parsed minutes from value '%s' -> %s", s, digits)
+        return int(digits)
+    logger.debug("Could not parse minutes from value: %s", s)
+    return None
+
+
+def get_default_fire_rating(building_use):
+    """Get the default fire rating (minutes) for a building use.
+    
+    This is used when an element has no FireRating property.
+    Falls back to the minimum required rating for the given use.
+    """
+    try:
+        defaults = _SI6_DATA.get("_defaults", {})
+        key = _normalize_use_label(building_use)
+        default = defaults.get(key)
+        if default is not None:
+            logger.debug("Using default fire rating for use '%s': %s minutes", building_use, default)
+            return default
+    except Exception as e:
+        logger.debug("Failed to get default fire rating: %s", e)
+    return None
+
+
+def _detect_length_unit_scale(model):
+    """Detect length unit used in the IFC `model` and return a multiplier to convert
+    values to metres. Returns `None` if detection failed and the caller should
+    fall back to heuristics.
+
+    Examples:
+        If unit is millimetre -> returns 0.001
+        If unit is metre -> returns 1.0
+    """
+    try:
+        projects = model.by_type('IfcProject')
+        if not projects:
+            return None
+        proj = projects[0]
+        units = getattr(proj, 'UnitsInContext', None)
+        if not units:
+            return None
+        unit_list = getattr(units, 'Units', [])
+
+        for u in unit_list:
+            # SI units with possible prefix
+            if u.is_a('IfcSIUnit'):
+                if getattr(u, 'UnitType', None) and u.UnitType == 'LENGTHUNIT':
+                    # Prefix may be None or an enum like 'MILLI'
+                    prefix = getattr(u, 'Prefix', None)
+                    name = getattr(u, 'Name', None)
+                    # Map prefixes to scale factors
+                    prefix_map = {
+                        'MILLI': 1e-3,
+                        'CENTI': 1e-2,
+                        'DECI': 1e-1,
+                        'NONE': 1.0,
+                        None: 1.0,
+                    }
+                    # Some Ifc files set Name to METRE
+                    scale = prefix_map.get(str(prefix).upper(), 1.0)
+                    # If Name indicates metre explicitly, return scale
+                    if name and str(name).upper().startswith('METRE'):
+                        return scale
+
+            # Conversion-based units (common for mm, inch etc.)
+            if u.is_a('IfcConversionBasedUnit'):
+                if getattr(u, 'UnitType', None) and u.UnitType == 'LENGTHUNIT':
+                    uname = str(getattr(u, 'Name', '')).lower()
+                    if 'millimet' in uname or 'millimetre' in uname or 'millimeter' in uname:
+                        return 0.001
+                    if 'centimet' in uname:
+                        return 0.01
+                    if 'inch' in uname:
+                        return 0.0254
+                    if 'foot' in uname:
+                        return 0.3048
+                    if 'metre' in uname or 'meter' in uname:
+                        return 1.0
+
+        # No explicit length unit found
+        return None
+    except Exception as e:
+        logger.debug("Unit detection failed: %s", e)
+        return None
 
 
 def get_height_band(evacuation_height_m, is_basement=False):
@@ -36,10 +189,24 @@ def get_height_band(evacuation_height_m, is_basement=False):
         return "h_gt_28"
 
 
+def _normalize_use_label(label):
+    """Normalize user-provided building use labels to JSON keys.
+
+    Examples:
+        'Residential' -> 'residential'
+        'public assembly' -> 'public_assembly'
+    """
+    if not label:
+        return label
+    return label.strip().lower().replace(" ", "_").replace("-", "_")
+
+
 def get_required_R(building_use, evacuation_height_m, is_basement=False):
     """Returns the required fire resistance in minutes for a given use and height."""
-    use = SI6_TABLE_3_1.get(building_use.lower())
+    key = _normalize_use_label(building_use)
+    use = SI6_TABLE_3_1.get(key)
     if not use:
+        logger.warning("Unrecognised building use '%s' (normalized: '%s'). Valid options: %s", building_use, key, list(SI6_TABLE_3_1.keys()))
         return None
     if "all" in use:
         return use["all"]
@@ -47,23 +214,51 @@ def get_required_R(building_use, evacuation_height_m, is_basement=False):
     return use.get(band)
 
 
-def get_fire_rating(element):
+def get_fire_rating(element, building_use=None):
     """
     Reads the FireRating property from an IFC element.
     Returns an integer (minutes) or None if not found.
     e.g. 'R90' → 90
+    
+    If the element has no FireRating property and building_use is provided,
+    falls back to the default rating for that building use.
+    
+    Only accepts properties with fire-rating-related names to avoid false positives
+    from generic numeric properties.
     """
-    for rel in element.IsDefinedBy:
+    for rel in getattr(element, 'IsDefinedBy', []):
         if rel.is_a("IfcRelDefinesByProperties"):
             pset = rel.RelatingPropertyDefinition
+            pset_name = getattr(pset, 'Name', '?')
             if hasattr(pset, "HasProperties"):
                 for prop in pset.HasProperties:
-                    if prop.Name == "FireRating":
-                        val = prop.NominalValue
-                        if val:
-                            raw = str(val.wrappedValue)
-                            numeric = ''.join(filter(str.isdigit, raw))
-                            return int(numeric) if numeric else None
+                    name = getattr(prop, 'Name', None)
+                    nnorm = _normalize_prop_name(name)
+
+                    # Only parse if the property name matches known variants (strict).
+                    # This avoids false positives from unrelated numeric properties.
+                    if any(v in nnorm for v in FIRE_RATING_FIELD_VARIANTS) or 'fire' in nnorm or 'fuego' in nnorm:
+                        val = getattr(prop, 'NominalValue', None) or getattr(prop, 'Value', None)
+                        # handle IfcLabel/IfcText wrapping
+                        raw = None
+                        if hasattr(val, 'wrappedValue'):
+                            raw = val.wrappedValue
+                        elif val is not None:
+                            raw = val
+                        minutes = _parse_minutes_from_value(raw)
+                        if minutes is not None:
+                            logger.debug("Found FireRating: property='%s' pset='%s' value=%s minutes", name, pset_name, minutes)
+                            return minutes
+
+    # No explicit FireRating found; try default for building use
+    if building_use:
+        default = get_default_fire_rating(building_use)
+        if default is not None:
+            logger.debug("No explicit FireRating for element %s; using default %s minutes for use '%s'", 
+                        getattr(element, 'GlobalId', '(no id)'), default, building_use)
+            return default
+
+    logger.debug("No FireRating found for element %s", getattr(element, 'GlobalId', '(no id)'))
     return None
 
 
@@ -76,15 +271,33 @@ def extract_building_use_from_ifc(model):
     buildings = model.by_type("IfcBuilding")
     if buildings:
         building = buildings[0]
-        # Check for usage description in Description or other properties
-        if hasattr(building, "Description") and building.Description:
-            desc = str(building.Description).lower()
-            if "residential" in desc:
-                return "residential"
-            elif "commercial" in desc:
-                return "commercial"
-            elif "office" in desc:
-                return "office"
+        # Try multiple attributes for hints
+        candidates = []
+        for attr in ("Name", "Description", "ObjectType", "LongName"):
+            if hasattr(building, attr) and getattr(building, attr):
+                candidates.append(str(getattr(building, attr)))
+
+        # Try classification references if present
+        try:
+            if hasattr(building, 'IsDefinedBy'):
+                for rel in building.IsDefinedBy:
+                    if rel.is_a('IfcRelDefinesByProperties'):
+                        pset = rel.RelatingPropertyDefinition
+                        if hasattr(pset, 'HasProperties'):
+                            for prop in pset.HasProperties:
+                                val = getattr(prop, 'NominalValue', None) or getattr(prop, 'Value', None)
+                                if val is not None:
+                                    candidates.append(str(getattr(val, 'wrappedValue', val)))
+        except Exception:
+            pass
+
+        # Match against multilingual map
+        for c in candidates:
+            match = _match_building_use(c)
+            if match:
+                return match
+
+    logger.info("No building use detected in IFC; defaulting to 'residential'")
     return "residential"  # Default fallback
 
 
@@ -104,11 +317,24 @@ def extract_evacuation_height_from_ifc(model):
             elevation = float(storey.Elevation)
             if elevation > max_elevation:
                 max_elevation = elevation
-
     # If no elevation data, try to extract from geometry
     if max_elevation == 0.0:
         return 20.0
 
+    # Try to detect project length units precisely from IfcUnitAssignment
+    scale = _detect_length_unit_scale(model)
+    if scale is not None:
+        if scale != 1.0:
+            logger.info("Converting elevations using detected length-unit scale: %s -> metres", scale)
+        return max_elevation * scale
+
+    # Fallback heuristic: many IFC files store elevations in millimetres.
+    # If the extracted elevation looks very large (>1000), assume it is mm and convert to metres.
+    if max_elevation > 1000:
+        logger.info("Detected elevation %.3f - assuming millimetres, converting to metres (fallback)", max_elevation)
+        return max_elevation / 1000.0
+
+    # Otherwise assume elevations are already in metres
     return max_elevation
 
 
@@ -146,7 +372,13 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
         "IfcBeam",
         "IfcColumn",
         "IfcSlab",
-        "IfcMember"
+        "IfcMember",
+        "IfcWall",
+        "IfcFooting",
+        "IfcRoof",
+        "IfcStair",
+        "IfcStairFlight",
+        "IfcRailing",
     ]
 
     # Results report
@@ -163,7 +395,7 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
     for ifc_type in element_types:
         for element in model.by_type(ifc_type):
             name     = element.Name or element.GlobalId
-            actual_R = get_fire_rating(element)
+            actual_R = get_fire_rating(element, building_use)
 
             entry = {
                 "id":         element.GlobalId,
@@ -199,15 +431,23 @@ def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basemen
 
 if __name__ == "__main__":
 
-    # --- Test 1: Residential building, 20m evacuation height ---
+    # Ensure logging is configured when executed as a script
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+    # --- Test 1: Auto-detect building use and height from IFC ---
+    ifc_path = "00_data/ifc_models/01_Duplex_Apartment.ifc"
+    model = ifcopenshell.open(ifc_path)
+    building_use = extract_building_use_from_ifc(model)
+    evacuation_height_m = extract_evacuation_height_from_ifc(model)
+
     report = check_si6_compliance(
-        ifc_path            = "00_data/ifc_models/01_Duplex_Apartment.ifc",
-        building_use        = "residential",
-        evacuation_height_m = 20
+        ifc_path            = ifc_path,
+        building_use        = building_use,
+        evacuation_height_m = evacuation_height_m
     )
 
     print("=" * 50)
-    print("TEST 1 — Residential, 20m")
+    print(f"TEST 1 — {building_use.replace('_', ' ').title()}, {evacuation_height_m:.1f}m")
     print("=" * 50)
     print(f"Required R rating  : R{report['required_R']}")
     print(f"Compliant elements : {len(report['compliant'])}")
@@ -227,67 +467,5 @@ if __name__ == "__main__":
         for el in report["no_data"]:
             print(f"  [{el['type']}] {el['name']} — {el['issue']}")
 
-    # --- Test 2: Auto-extract IFC file parameters and check structural fire compliance ---
-    print("\n" + "=" * 70)
-    print("TEST 2 — Automatic IFC Analysis & Structural Fire Compliance Check")
-    print("=" * 70)
-    
-    ifc_file_path = "00_data/ifc_models/Ifc4_Revit_ARC_FireRatingAdded.ifc"
-    print(f"\nIFC File: {ifc_file_path}")
-    
-    # Automatically extract building parameters
-    model = ifcopenshell.open(ifc_file_path)
-    auto_building_use = extract_building_use_from_ifc(model)
-    auto_evacuation_height = extract_evacuation_height_from_ifc(model)
-    
-    print("\n--- Automatically Extracted Parameters ---")
-    print(f"Building Use         : {auto_building_use.upper()}")
-    print(f"Evacuation Height    : {auto_evacuation_height}m")
-    
-    # Get structural element information
-    all_beams = model.by_type("IfcBeam")
-    all_columns = model.by_type("IfcColumn")
-    all_slabs = model.by_type("IfcSlab")
-    all_members = model.by_type("IfcMember")
-    total_structural = len(all_beams) + len(all_columns) + len(all_slabs) + len(all_members)
-    
-    print(f"\n--- Structural Elements Found ---")
-    print(f"Beams                : {len(all_beams)}")
-    print(f"Columns              : {len(all_columns)}")
-    print(f"Slabs                : {len(all_slabs)}")
-    print(f"Members              : {len(all_members)}")
-    print(f"Total Elements       : {total_structural}")
-    
-    # Run structural fire compliance check
-    print(f"\n--- Running Structural Fire Compliance Check ---")
-    report2 = check_si6_compliance(
-        ifc_path            = ifc_file_path,
-        building_use        = auto_building_use,
-        evacuation_height_m = auto_evacuation_height
-    )
-    
-    print(f"\nRequired Fire Resistance (SI 6 Table 3.1) : R{report2['required_R']} minutes")
-    print(f"Compliant Elements   : {len(report2['compliant'])}")
-    print(f"Non-Compliant        : {len(report2['non_compliant'])}")
-    print(f"Missing Fire Rating  : {len(report2['no_data'])}")
-    print(f"\n✓ OVERALL STRUCTURAL COMPLIANCE: {('PASS ✓' if report2['overall_compliant'] else 'FAIL ✗')}")
-    
-    if report2["non_compliant"]:
-        print(f"\n--- Non-Compliant Structural Elements ({len(report2['non_compliant'])}) ---")
-        for i, el in enumerate(report2["non_compliant"][:5], 1):
-            deficit = el.get('deficit', el['required_R'] - (el['actual_R'] or 0))
-            print(f"{i}. [{el['type']}] {el['name']}")
-            print(f"   Required: R{el['required_R']} | Actual: R{el['actual_R'] or 'N/A'} | Deficit: {deficit} min")
-        if len(report2["non_compliant"]) > 5:
-            print(f"   ... and {len(report2['non_compliant']) - 5} more non-compliant elements")
-    
-    if report2["no_data"]:
-        print(f"\n--- Structural Elements With Missing Fire Rating Data ({len(report2['no_data'])}) ---")
-        material_missing = {}
-        for el in report2["no_data"]:
-            material_missing[el['type']] = material_missing.get(el['type'], 0) + 1
-        
-        for elem_type, count in material_missing.items():
-            print(f"  {elem_type}: {count} elements without FireRating property")
-    
-    print("\n" + "=" * 70)
+
+

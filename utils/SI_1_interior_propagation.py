@@ -1,8 +1,9 @@
-from pathlib import Path
+﻿from pathlib import Path
 from collections import defaultdict
 from typing import Dict, Any, Callable, Optional, List
 import re
 import json
+import argparse
 import ifcopenshell
 
 
@@ -311,18 +312,6 @@ def check_special_risk_rooms(spaces: List[Dict[str, Any]], rules: Dict[str, Any]
 
     debug_long_name_hits = 0
 
-    # Debug: print basic keyword config information
-    try:
-        print(f"[SI1][special_risk] keyword groups: {len(keywords_cfg)}")
-        kitchen_cfg = keywords_cfg.get("kitchen")
-        if isinstance(kitchen_cfg, dict):
-            kitchen_kw_list = kitchen_cfg.get("keywords", []) or []
-        else:
-            kitchen_kw_list = kitchen_cfg or []
-        print(f"[SI1][special_risk] kitchen sample keywords: {kitchen_kw_list[:3]}")
-    except Exception:
-        pass
-
     for sp in spaces:
         # Collect searchable text
         name = sp.get("name") or ""
@@ -346,13 +335,6 @@ def check_special_risk_rooms(spaces: List[Dict[str, Any]], rules: Dict[str, Any]
         ln_norm = _norm_text(long_name)
         if ln_norm and any(kw in ln_norm for kw in all_keyword_norms):
             debug_long_name_hits += 1
-
-        # Debug: print searchable text for specific test spaces (e.g. A103, B103)
-        try:
-            if name in ("A103", "B103"):
-                print(f"[SI1][special_risk] space {name} searchable text: {text}")
-        except Exception:
-            pass
 
         detected_type: Optional[str] = None
         matched_keywords: List[str] = []
@@ -465,6 +447,179 @@ def check_special_risk_rooms(spaces: List[Dict[str, Any]], rules: Dict[str, Any]
             "debug_long_name_keyword_hit_count": debug_long_name_hits,
         },
     }
+
+
+def _collect_space_boundary_relationships(ifc_file) -> List[Any]:
+    rels: Dict[int, Any] = {}
+    for rel_type in ("IfcRelSpaceBoundary", "IfcRelSpaceBoundary1stLevel", "IfcRelSpaceBoundary2ndLevel"):
+        try:
+            for rel in ifc_file.by_type(rel_type) or []:
+                try:
+                    rels[rel.id()] = rel
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return list(rels.values())
+
+
+def build_door_space_adjacency(ifc_file) -> Dict[str, List[str]]:
+    """
+    Return door -> adjacent spaces map from IfcRelSpaceBoundary* relationships.
+    If only one adjacent space is found for a door, list has length 1.
+    """
+    door_to_spaces = defaultdict(set)
+
+    for rel in _collect_space_boundary_relationships(ifc_file):
+        space = safe_attr(rel, "RelatingSpace")
+        elem = safe_attr(rel, "RelatedBuildingElement")
+        if not space or not elem:
+            continue
+        if not space.is_a("IfcSpace") or not elem.is_a("IfcDoor"):
+            continue
+
+        door_guid = safe_attr(elem, "GlobalId") or f"id:{elem.id()}"
+        space_guid = safe_attr(space, "GlobalId") or f"id:{space.id()}"
+        door_to_spaces[str(door_guid)].add(str(space_guid))
+
+    return {door_guid: sorted(list(space_guids)) for door_guid, space_guids in door_to_spaces.items()}
+
+
+def _extract_door_fire_rating(door) -> Optional[str]:
+    try:
+        fr = safe_attr(door, "FireRating")
+        if fr is not None and str(fr).strip():
+            return str(fr).strip()
+    except Exception:
+        pass
+
+    try:
+        psets = get_psets(door)
+        for pset_name in ("Pset_DoorCommon", "Pset_DoorWindowGlazingType"):
+            pset = psets.get(pset_name, {})
+            if not isinstance(pset, dict):
+                continue
+            for key in ("FireRating", "FireResistanceRating", "Rating"):
+                value = pset.get(key)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+    except Exception:
+        pass
+
+    try:
+        for rel in safe_attr(door, "IsDefinedBy", []) or []:
+            if not rel.is_a("IfcRelDefinesByType"):
+                continue
+            dtype = safe_attr(rel, "RelatingType")
+            if not dtype:
+                continue
+
+            fr = safe_attr(dtype, "FireRating")
+            if fr is not None and str(fr).strip():
+                return str(fr).strip()
+
+            psets = get_psets(dtype)
+            pset = psets.get("Pset_DoorCommon", {})
+            if isinstance(pset, dict):
+                for key in ("FireRating", "FireResistanceRating", "Rating"):
+                    value = pset.get(key)
+                    if value is not None and str(value).strip():
+                        return str(value).strip()
+    except Exception:
+        pass
+
+    return None
+
+
+def _door_by_guid(ifc_file) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for door in ifc_file.by_type("IfcDoor") or []:
+        guid = safe_attr(door, "GlobalId") or f"id:{door.id()}"
+        out[str(guid)] = door
+    return out
+
+
+def check_special_risk_boundary_doors(ifc_file, special_risk_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Evaluate doors on special risk room boundaries.
+    """
+    risk_items = (special_risk_result.get("details") or {}).get("items") or []
+    risk_guids = {str(item.get("guid")) for item in risk_items if item.get("guid")}
+
+    adjacency = build_door_space_adjacency(ifc_file)
+    if not adjacency:
+        return {
+            "result": "INCOMPLETE",
+            "details": {
+                "detected_risk_rooms_count": len(risk_guids),
+                "boundary_doors_count": 0,
+                "doors": [],
+                "messages": ["No IfcRelSpaceBoundary / cannot map doors to spaces"],
+            },
+        }
+
+    by_guid = _door_by_guid(ifc_file)
+    doors: List[Dict[str, Any]] = []
+    missing_rating_count = 0
+    has_any_rating = False
+
+    for door_guid, adjacent_spaces in adjacency.items():
+        risk_spaces = [sg for sg in adjacent_spaces if sg in risk_guids]
+        if not risk_spaces:
+            continue
+
+        connects_risk_room_guid = risk_spaces[0]
+        other_spaces = [sg for sg in adjacent_spaces if sg != connects_risk_room_guid]
+        connects_to_space_guid = other_spaces[0] if other_spaces else None
+
+        rating = _extract_door_fire_rating(by_guid.get(door_guid)) if door_guid in by_guid else None
+        if rating is None:
+            missing_rating_count += 1
+        else:
+            has_any_rating = True
+
+        doors.append({
+            "door_guid": door_guid,
+            "adjacent_spaces": list(adjacent_spaces),
+            "connects_risk_room_guid": connects_risk_room_guid,
+            "connects_to_space_guid": connects_to_space_guid,
+            "fire_rating": rating,
+        })
+
+    if not doors:
+        return {
+            "result": "PASS",
+            "details": {
+                "detected_risk_rooms_count": len(risk_guids),
+                "boundary_doors_count": 0,
+                "doors": [],
+                "messages": ["No door found adjacent to detected special risk rooms."],
+            },
+        }
+
+    messages: List[str] = []
+    if missing_rating_count > 0:
+        messages.append(f"{missing_rating_count} boundary door(s) have missing fire_rating.")
+
+    if missing_rating_count > 0 and not has_any_rating:
+        result = "INCOMPLETE"
+        messages.append("Door fire ratings appear unavailable globally in this model.")
+    elif missing_rating_count > 0:
+        result = "FAIL"
+    else:
+        result = "PASS"
+
+    return {
+        "result": result,
+        "details": {
+            "detected_risk_rooms_count": len(risk_guids),
+            "boundary_doors_count": len(doors),
+            "doors": doors,
+            "messages": messages,
+        },
+    }
+
+
 # ---------- core ----------
 def scan_one_ifc(ifc_path: str, exclude_space_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None):
     ifc = ifcopenshell.open(ifc_path)
@@ -546,6 +701,7 @@ def scan_one_ifc(ifc_path: str, exclude_space_predicate: Optional[Callable[[Dict
     rules = load_rules_config(str(DEFAULT_RULES_CONFIG_PATH))
     sector_size_result = check_sector_size_compliance(sector_stats_out, rules)
     special_risk_result = check_special_risk_rooms(space_rows, rules)
+    special_risk_boundary_doors_result = check_special_risk_boundary_doors(ifc, special_risk_result)
 
     # ---------- Final Output ----------
     return {
@@ -582,6 +738,7 @@ def scan_one_ifc(ifc_path: str, exclude_space_predicate: Optional[Callable[[Dict
         #  SI1 compliance result
         "si1_sector_size": sector_size_result,
         "si1_special_risk_rooms": special_risk_result,
+        "si1_special_risk_boundary_doors": special_risk_boundary_doors_result,
     }
 
 
@@ -722,8 +879,268 @@ def scan_folder(folder_path: str, recursive: bool = True):
 
     return {"folder": str(folder), "files_checked": len(files), "results": results}
 
+
+def to_row(
+    id: str,
+    check_result_id: str,
+    element_id: Optional[str] = None,
+    element_type: Optional[str] = None,
+    element_name: Optional[str] = None,
+    element_name_long: Optional[str] = None,
+    check_status: str = "log",
+    actual_value: Optional[str] = None,
+    required_value: Optional[str] = None,
+    comment: Optional[str] = None,
+    log: Optional[str] = None,
+) -> Dict[str, Any]:
+    allowed = {"pass", "fail", "warning", "blocked", "log"}
+    status = check_status if check_status in allowed else "log"
+    return {
+        "id": str(id),
+        "check_result_id": str(check_result_id),
+        "element_id": str(element_id) if element_id is not None else None,
+        "element_type": str(element_type) if element_type is not None else None,
+        "element_name": str(element_name) if element_name is not None else None,
+        "element_name_long": str(element_name_long) if element_name_long is not None else None,
+        "check_status": status,
+        "actual_value": str(actual_value) if actual_value is not None else None,
+        "required_value": str(required_value) if required_value is not None else None,
+        "comment": str(comment) if comment is not None else None,
+        "log": str(log) if log is not None else None,
+    }
+
+
+def _make_event_id(check_result_id: str, element_id: Optional[str], element_name: Optional[str], index: int) -> str:
+    anchor = element_id if element_id else (element_name if element_name else "NONE")
+    return f"{check_result_id}:{anchor}:{index}"
+
+
+def _build_events_sector_size(file_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    checks = ((file_result.get("si1_sector_size") or {}).get("details") or {}).get("sector_checks") or []
+    detail_messages = ((file_result.get("si1_sector_size") or {}).get("details") or {}).get("messages") or []
+    has_sector_labels = bool((file_result.get("data_quality") or {}).get("has_sector_labels"))
+
+    for c in checks:
+        sector_id = c.get("sector")
+        if c.get("status") == "PASS":
+            status = "pass"
+        elif c.get("status") == "FAIL":
+            status = "fail"
+        else:
+            status = "blocked"
+
+        area = c.get("area_total_m2")
+        limit = c.get("limit_m2")
+        comment = c.get("reason") or "Sector size evaluated against configured limit."
+        log_msg = " | ".join(str(m) for m in detail_messages) if detail_messages else None
+        element_name = str(sector_id) if sector_id is not None else None
+
+        rows.append(
+            to_row(
+                id=_make_event_id("SI1_SECTOR_SIZE", None, element_name, len(rows)),
+                check_result_id="SI1_SECTOR_SIZE",
+                element_id=None,
+                element_type="IfcZone" if has_sector_labels else "FireSector",
+                element_name=element_name,
+                element_name_long=None,
+                check_status=status,
+                actual_value=str(area) if area is not None else None,
+                required_value=str(limit) if limit is not None else None,
+                comment=comment,
+                log=log_msg,
+            )
+        )
+    return rows
+
+
+def _build_events_special_risk_rooms(file_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    items = ((file_result.get("si1_special_risk_rooms") or {}).get("details") or {}).get("items") or []
+    for it in items:
+        guid = it.get("guid")
+        dtype = it.get("detected_type")
+        kws = it.get("matched_keywords") or []
+        kws_text = ", ".join(str(k) for k in kws) if kws else "none"
+        zones = ", ".join(str(z) for z in (it.get("zones") or [])) if it.get("zones") else "none"
+
+        rows.append(
+            to_row(
+                id=_make_event_id("SI1_SPECIAL_RISK_ROOM", guid, it.get("name"), len(rows)),
+                check_result_id="SI1_SPECIAL_RISK_ROOM",
+                element_id=guid,
+                element_type="IfcSpace",
+                element_name=it.get("name"),
+                element_name_long=it.get("long_name"),
+                check_status="warning",
+                actual_value=f"type={dtype}; keywords=[{kws_text}]",
+                required_value="N/A",
+                comment="Special risk room detected; manual DB-SI requirement confirmation is needed.",
+                log=f"storey={it.get('storey')}; zones={zones}",
+            )
+        )
+    return rows
+
+
+def _build_events_boundary_doors(file_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    srbd = file_result.get("si1_special_risk_boundary_doors") or {}
+    details = srbd.get("details") or {}
+    doors = details.get("doors") or []
+    messages = details.get("messages") or []
+
+    if srbd.get("result") == "INCOMPLETE" and not doors:
+        rows.append(
+            to_row(
+                id=_make_event_id("SI1_BOUNDARY_DOOR_RATING", None, "SUMMARY", len(rows)),
+                check_result_id="SI1_BOUNDARY_DOOR_RATING",
+                element_id=None,
+                element_type=None,
+                element_name=None,
+                element_name_long=None,
+                check_status="blocked",
+                actual_value="doors_checked=0, with_rating=0, missing_rating=0",
+                required_value="FireRating required for risk-room boundary door",
+                comment="No IfcRelSpaceBoundary, cannot map doors to spaces.",
+                log=" | ".join(str(m) for m in messages) if messages else None,
+            )
+        )
+        return rows
+
+    with_rating = 0
+    missing_rating = 0
+    for d in doors:
+        guid = d.get("door_guid")
+        rating = d.get("fire_rating")
+        if rating is None:
+            missing_rating += 1
+            status = "fail"
+            actual = "missing"
+            comment = "Boundary door has no FireRating."
+        else:
+            with_rating += 1
+            status = "pass"
+            actual = str(rating)
+            comment = "Boundary door has FireRating."
+
+        rows.append(
+            to_row(
+                id=_make_event_id("SI1_BOUNDARY_DOOR_RATING", guid, None, len(rows)),
+                check_result_id="SI1_BOUNDARY_DOOR_RATING",
+                element_id=guid,
+                element_type="IfcDoor",
+                element_name=None,
+                element_name_long=None,
+                check_status=status,
+                actual_value=actual,
+                required_value="FireRating required for risk-room boundary door",
+                comment=comment,
+                log=f"adjacent_spaces={d.get('adjacent_spaces')}; risk_space={d.get('connects_risk_room_guid')}; target_space={d.get('connects_to_space_guid')}",
+            )
+        )
+
+    total = len(doors)
+    summary_status = "warning" if total == 0 else ("fail" if missing_rating > 0 else "pass")
+    rows.append(
+        to_row(
+            id=_make_event_id("SI1_BOUNDARY_DOOR_RATING", None, "SUMMARY", len(rows)),
+            check_result_id="SI1_BOUNDARY_DOOR_RATING",
+            element_id=None,
+            element_type=None,
+            element_name=None,
+            element_name_long=None,
+            check_status=summary_status,
+            actual_value=f"doors_checked={total}, with_rating={with_rating}, missing_rating={missing_rating}",
+            required_value="All risk-room boundary doors must have FireRating",
+            comment="Summary of FireRating presence for doors on special risk room boundaries.",
+            log=" | ".join(str(m) for m in messages) if messages else None,
+        )
+    )
+    return rows
+
+
+def build_events(out: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for result in out.get("results", []):
+        if result.get("error"):
+            rows.append(
+                to_row(
+                    id=_make_event_id("SI1_LOG", None, str(result.get("file") or "unknown"), len(rows)),
+                    check_result_id="SI1_LOG",
+                    element_id=None,
+                    element_type=None,
+                    element_name=str(result.get("file") or "unknown"),
+                    element_name_long=None,
+                    check_status="blocked",
+                    actual_value=None,
+                    required_value=None,
+                    comment="File scan failed.",
+                    log=str(result.get("error")),
+                )
+            )
+            continue
+
+        rows.extend(_build_events_sector_size(result))
+        rows.extend(_build_events_special_risk_rooms(result))
+        rows.extend(_build_events_boundary_doors(result))
+    return rows
+
+
+def split_events(events: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    ok = [e for e in events if e.get("check_status") in {"pass", "warning", "log"}]
+    problems = [e for e in events if e.get("check_status") in {"fail", "blocked"}]
+    return {"ok": ok, "problems": problems}
+
+def _renumber_event_ids(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for i, e in enumerate(events):
+        check_result_id = str(e.get("check_result_id") or "UNKNOWN")
+        anchor = e.get("element_id") or e.get("element_name") or "NONE"
+        row = dict(e)
+        row["id"] = f"{check_result_id}:{anchor}:{i}"
+        out.append(row)
+    return out
+
+
 if __name__ == "__main__":
-    import json
-    folder_path = r"C:\Users\gorkem\Documents\GitHub\automatic-fire-compliance-checker\00_data\ifc_models"
-    out = scan_folder(folder_path, recursive=True)
-    print(json.dumps(out, indent=2))
+    parser = argparse.ArgumentParser(description="CTE DB-SI SI1 interior propagation checker")
+    parser.add_argument(
+        "--folder",
+        type=str,
+        default=r"C:\Users\gorkem\Documents\GitHub\automatic-fire-compliance-checker\00_data\ifc_models",
+        help="Folder path containing IFC files",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        default=True,
+        help="Scan folder recursively (default: true)",
+    )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Print additional structured terminal report rows",
+    )
+    parser.add_argument(
+        "--events",
+        action="store_true",
+        help="Print only events JSON array to stdout",
+    )
+    parser.add_argument(
+        "--events_split",
+        action="store_true",
+        help="With --events, print JSON object wrapper: {\"ok\": [...], \"problems\": [...]}",
+    )
+    args = parser.parse_args()
+
+    out = scan_folder(args.folder, recursive=args.recursive)
+    if args.events:
+        events = _renumber_event_ids(build_events(out))
+        if args.events_split:
+            print(json.dumps(split_events(events), indent=2, ensure_ascii=False))
+        else:
+            print(json.dumps(events, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(out, indent=2))
+        if args.pretty:
+            print(json.dumps(_renumber_event_ids(build_events(out)), indent=2, ensure_ascii=False))

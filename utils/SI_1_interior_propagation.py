@@ -485,27 +485,88 @@ def build_door_space_adjacency(ifc_file) -> Dict[str, List[str]]:
     return {door_guid: sorted(list(space_guids)) for door_guid, space_guids in door_to_spaces.items()}
 
 
-def _extract_door_fire_rating(door) -> Optional[str]:
-    try:
-        fr = safe_attr(door, "FireRating")
-        if fr is not None and str(fr).strip():
-            return str(fr).strip()
-    except Exception:
-        pass
+def _normalize_fire_rating_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
 
+
+def _is_valid_fire_rating_value(value: Any) -> bool:
+    norm = _normalize_fire_rating_value(value)
+    invalid = {"", "-", "n/a", "na", "null", "none"}
+    if norm in invalid:
+        return False
+    if norm in {"fire rating", "firerating"}:
+        return False
+    return True
+
+
+def _extract_door_fire_rating_info(door) -> Dict[str, Any]:
+    """
+    Extract fire rating with provenance and validity.
+    Priority: Pset_DoorCommon.FireRating first, then fallbacks.
+    """
+    if door is None:
+        return {
+            "property_exists": False,
+            "raw_value": None,
+            "normalized_value": "",
+            "is_valid": False,
+            "source": None,
+        }
+
+    # 1) Preferred source: door pset Pset_DoorCommon.FireRating
     try:
         psets = get_psets(door)
-        for pset_name in ("Pset_DoorCommon", "Pset_DoorWindowGlazingType"):
-            pset = psets.get(pset_name, {})
-            if not isinstance(pset, dict):
-                continue
-            for key in ("FireRating", "FireResistanceRating", "Rating"):
-                value = pset.get(key)
-                if value is not None and str(value).strip():
-                    return str(value).strip()
+        pset_dc = psets.get("Pset_DoorCommon", {})
+        if isinstance(pset_dc, dict) and "FireRating" in pset_dc:
+            raw = pset_dc.get("FireRating")
+            return {
+                "property_exists": True,
+                "raw_value": None if raw is None else str(raw),
+                "normalized_value": _normalize_fire_rating_value(raw),
+                "is_valid": _is_valid_fire_rating_value(raw),
+                "source": "Pset_DoorCommon.FireRating",
+            }
     except Exception:
         pass
 
+    # 2) Door direct attribute
+    try:
+        attr_val = safe_attr(door, "FireRating")
+        if attr_val is not None:
+            return {
+                "property_exists": True,
+                "raw_value": str(attr_val),
+                "normalized_value": _normalize_fire_rating_value(attr_val),
+                "is_valid": _is_valid_fire_rating_value(attr_val),
+                "source": "IfcDoor.FireRating",
+            }
+    except Exception:
+        pass
+
+    # 3) Other door pset fallbacks
+    try:
+        psets = get_psets(door)
+        for pset_name, key in (
+            ("Pset_DoorWindowGlazingType", "FireRating"),
+            ("Pset_DoorCommon", "FireResistanceRating"),
+            ("Pset_DoorCommon", "Rating"),
+        ):
+            pset = psets.get(pset_name, {})
+            if isinstance(pset, dict) and key in pset:
+                raw = pset.get(key)
+                return {
+                    "property_exists": True,
+                    "raw_value": None if raw is None else str(raw),
+                    "normalized_value": _normalize_fire_rating_value(raw),
+                    "is_valid": _is_valid_fire_rating_value(raw),
+                    "source": f"{pset_name}.{key}",
+                }
+    except Exception:
+        pass
+
+    # 4) Type-based fallbacks
     try:
         for rel in safe_attr(door, "IsDefinedBy", []) or []:
             if not rel.is_a("IfcRelDefinesByType"):
@@ -514,21 +575,38 @@ def _extract_door_fire_rating(door) -> Optional[str]:
             if not dtype:
                 continue
 
-            fr = safe_attr(dtype, "FireRating")
-            if fr is not None and str(fr).strip():
-                return str(fr).strip()
+            type_attr = safe_attr(dtype, "FireRating")
+            if type_attr is not None:
+                return {
+                    "property_exists": True,
+                    "raw_value": str(type_attr),
+                    "normalized_value": _normalize_fire_rating_value(type_attr),
+                    "is_valid": _is_valid_fire_rating_value(type_attr),
+                    "source": "IfcDoorType.FireRating",
+                }
 
-            psets = get_psets(dtype)
-            pset = psets.get("Pset_DoorCommon", {})
-            if isinstance(pset, dict):
-                for key in ("FireRating", "FireResistanceRating", "Rating"):
-                    value = pset.get(key)
-                    if value is not None and str(value).strip():
-                        return str(value).strip()
+            psets_t = get_psets(dtype)
+            pset_dc_t = psets_t.get("Pset_DoorCommon", {})
+            for key in ("FireRating", "FireResistanceRating", "Rating"):
+                if isinstance(pset_dc_t, dict) and key in pset_dc_t:
+                    raw = pset_dc_t.get(key)
+                    return {
+                        "property_exists": True,
+                        "raw_value": None if raw is None else str(raw),
+                        "normalized_value": _normalize_fire_rating_value(raw),
+                        "is_valid": _is_valid_fire_rating_value(raw),
+                        "source": f"IfcDoorType.Pset_DoorCommon.{key}",
+                    }
     except Exception:
         pass
 
-    return None
+    return {
+        "property_exists": False,
+        "raw_value": None,
+        "normalized_value": "",
+        "is_valid": False,
+        "source": None,
+    }
 
 
 def _door_by_guid(ifc_file) -> Dict[str, Any]:
@@ -560,8 +638,9 @@ def check_special_risk_boundary_doors(ifc_file, special_risk_result: Dict[str, A
 
     by_guid = _door_by_guid(ifc_file)
     doors: List[Dict[str, Any]] = []
-    missing_rating_count = 0
-    has_any_rating = False
+    missing_property_count = 0
+    unusable_value_count = 0
+    valid_rating_count = 0
 
     for door_guid, adjacent_spaces in adjacency.items():
         risk_spaces = [sg for sg in adjacent_spaces if sg in risk_guids]
@@ -572,18 +651,30 @@ def check_special_risk_boundary_doors(ifc_file, special_risk_result: Dict[str, A
         other_spaces = [sg for sg in adjacent_spaces if sg != connects_risk_room_guid]
         connects_to_space_guid = other_spaces[0] if other_spaces else None
 
-        rating = _extract_door_fire_rating(by_guid.get(door_guid)) if door_guid in by_guid else None
-        if rating is None:
-            missing_rating_count += 1
+        rating_info = _extract_door_fire_rating_info(by_guid.get(door_guid)) if door_guid in by_guid else {
+            "property_exists": False,
+            "raw_value": None,
+            "normalized_value": "",
+            "is_valid": False,
+            "source": None,
+        }
+        if not rating_info.get("property_exists"):
+            missing_property_count += 1
+        elif not rating_info.get("is_valid"):
+            unusable_value_count += 1
         else:
-            has_any_rating = True
+            valid_rating_count += 1
 
         doors.append({
             "door_guid": door_guid,
             "adjacent_spaces": list(adjacent_spaces),
             "connects_risk_room_guid": connects_risk_room_guid,
             "connects_to_space_guid": connects_to_space_guid,
-            "fire_rating": rating,
+            "fire_rating": rating_info.get("raw_value"),
+            "fire_rating_source": rating_info.get("source"),
+            "fire_rating_normalized": rating_info.get("normalized_value"),
+            "fire_rating_property_exists": bool(rating_info.get("property_exists")),
+            "fire_rating_is_valid": bool(rating_info.get("is_valid")),
         })
 
     if not doors:
@@ -598,13 +689,15 @@ def check_special_risk_boundary_doors(ifc_file, special_risk_result: Dict[str, A
         }
 
     messages: List[str] = []
-    if missing_rating_count > 0:
-        messages.append(f"{missing_rating_count} boundary door(s) have missing fire_rating.")
+    if missing_property_count > 0:
+        messages.append(f"{missing_property_count} boundary door(s) are missing FireRating property.")
+    if unusable_value_count > 0:
+        messages.append(f"{unusable_value_count} boundary door(s) have FireRating field but unusable value.")
 
-    if missing_rating_count > 0 and not has_any_rating:
+    if valid_rating_count == 0:
         result = "INCOMPLETE"
-        messages.append("Door fire ratings appear unavailable globally in this model.")
-    elif missing_rating_count > 0:
+        messages.append("No boundary door has a usable FireRating value.")
+    elif missing_property_count > 0 or unusable_value_count > 0:
         result = "FAIL"
     else:
         result = "PASS"
@@ -614,6 +707,9 @@ def check_special_risk_boundary_doors(ifc_file, special_risk_result: Dict[str, A
         "details": {
             "detected_risk_rooms_count": len(risk_guids),
             "boundary_doors_count": len(doors),
+            "valid_rating_count": valid_rating_count,
+            "missing_property_count": missing_property_count,
+            "unusable_value_count": unusable_value_count,
             "doors": doors,
             "messages": messages,
         },
@@ -1012,16 +1108,24 @@ def _build_events_boundary_doors(file_result: Dict[str, Any]) -> List[Dict[str, 
     for d in doors:
         guid = d.get("door_guid")
         rating = d.get("fire_rating")
-        if rating is None:
-            missing_rating += 1
-            status = "fail"
-            actual = "missing"
-            comment = "Boundary door has no FireRating."
-        else:
+        source = d.get("fire_rating_source")
+        norm = d.get("fire_rating_normalized")
+        prop_exists = bool(d.get("fire_rating_property_exists"))
+        is_valid = bool(d.get("fire_rating_is_valid"))
+
+        if is_valid:
             with_rating += 1
             status = "pass"
-            actual = str(rating)
+            actual = str(rating) if rating is not None else ""
             comment = "Boundary door has FireRating."
+        else:
+            missing_rating += 1
+            status = "blocked"
+            actual = None if rating is None else str(rating)
+            if prop_exists:
+                comment = "Boundary door has FireRating field but no usable value."
+            else:
+                comment = "Boundary door is missing FireRating property."
 
         rows.append(
             to_row(
@@ -1035,12 +1139,17 @@ def _build_events_boundary_doors(file_result: Dict[str, Any]) -> List[Dict[str, 
                 actual_value=actual,
                 required_value="FireRating required for risk-room boundary door",
                 comment=comment,
-                log=f"adjacent_spaces={d.get('adjacent_spaces')}; risk_space={d.get('connects_risk_room_guid')}; target_space={d.get('connects_to_space_guid')}",
+                log=(
+                    f"adjacent_spaces={d.get('adjacent_spaces')}; "
+                    f"risk_space={d.get('connects_risk_room_guid')}; "
+                    f"target_space={d.get('connects_to_space_guid')}; "
+                    f"source={source}; raw={rating}; normalized={norm}"
+                ),
             )
         )
 
     total = len(doors)
-    summary_status = "warning" if total == 0 else ("fail" if missing_rating > 0 else "pass")
+    summary_status = "warning" if total == 0 else ("blocked" if missing_rating > 0 else "pass")
     rows.append(
         to_row(
             id=_make_event_id("SI1_BOUNDARY_DOOR_RATING", None, "SUMMARY", len(rows)),
@@ -1103,6 +1212,42 @@ def _renumber_event_ids(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def run_self_test_boundary_rating(duplex_ifc_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Self-test for SI1 boundary-door FireRating validation on Duplex IFC.
+    Confirms unusable FireRating values do not get PASS.
+    """
+    ifc_path = duplex_ifc_path or r"C:\Users\gorkem\Documents\GitHub\automatic-fire-compliance-checker\00_data\ifc_models\01_Duplex_Apartment.ifc"
+    try:
+        result = scan_one_ifc(ifc_path)
+    except Exception as e:
+        return {
+            "ok": False,
+            "ifc_path": ifc_path,
+            "error": str(e),
+        }
+
+    events = _renumber_event_ids(build_events({"results": [result]}))
+    door_events = [e for e in events if e.get("check_result_id") == "SI1_BOUNDARY_DOOR_RATING" and e.get("element_type") == "IfcDoor"]
+    invalid_tokens = {"", "-", "n/a", "na", "null", "none", "fire rating", "firerating"}
+
+    bad_pass = []
+    for e in door_events:
+        av = e.get("actual_value")
+        av_norm = (str(av).strip().lower() if av is not None else "")
+        is_invalid = av_norm in invalid_tokens
+        if is_invalid and e.get("check_status") == "pass":
+            bad_pass.append(e.get("id"))
+
+    return {
+        "ok": len(bad_pass) == 0,
+        "ifc_path": ifc_path,
+        "doors_checked": len(door_events),
+        "invalid_value_pass_count": len(bad_pass),
+        "invalid_value_pass_event_ids": bad_pass,
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CTE DB-SI SI1 interior propagation checker")
     parser.add_argument(
@@ -1137,7 +1282,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Print original full nested report JSON",
     )
+    parser.add_argument(
+        "--self_test_boundary_rating",
+        action="store_true",
+        help="Run Duplex self-test to verify unusable FireRating never yields PASS",
+    )
     args = parser.parse_args()
+
+    if args.self_test_boundary_rating:
+        print(json.dumps(run_self_test_boundary_rating(), indent=2, ensure_ascii=False))
+        raise SystemExit(0)
 
     out = scan_folder(args.folder, recursive=args.recursive)
     if args.full_report:

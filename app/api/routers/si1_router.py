@@ -33,8 +33,8 @@ import logging
 
 # Import the actual compliance functions from utils/
 # These are the ONLY connections to your utility files
-from tools.sub_si1_checker import scan_ifc_basic, check_sector_size_compliance, build_sectors
-from tools.SI_1_interior_propagation import load_rules_config
+from tools.checker_sub_si1_checker import scan_ifc_basic, check_sector_size_compliance, build_sectors
+from tools.checker_SI_1_interior_propagation import load_rules_config
 import ifcopenshell
 
 # Create router

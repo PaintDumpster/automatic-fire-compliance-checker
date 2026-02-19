@@ -1,4 +1,6 @@
-﻿from pathlib import Path
+﻿# library imports
+
+from pathlib import Path
 from collections import defaultdict
 from typing import Dict, Any, Callable, Optional, List
 import re
@@ -11,7 +13,7 @@ DEFAULT_RULES_CONFIG_PATH = Path(
     r"C:\Users\gorkem\Documents\GitHub\automatic-fire-compliance-checker\00_data\config\rulesdb_si_si1_rules.json"
 )
 
-
+# funtions
 def load_rules_config(path: str) -> Dict[str, Any]:
     """
     Load SI1 rules configuration from a JSON file.
@@ -1247,7 +1249,7 @@ def run_self_test_boundary_rating(duplex_ifc_path: Optional[str] = None) -> Dict
         "invalid_value_pass_event_ids": bad_pass,
     }
 
-
+# testıng
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CTE DB-SI SI1 interior propagation checker")
     parser.add_argument(

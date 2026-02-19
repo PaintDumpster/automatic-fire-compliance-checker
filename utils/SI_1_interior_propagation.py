@@ -1091,6 +1091,7 @@ def split_events(events: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]
     problems = [e for e in events if e.get("check_status") in {"fail", "blocked"}]
     return {"ok": ok, "problems": problems}
 
+
 def _renumber_event_ids(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for i, e in enumerate(events):
@@ -1131,16 +1132,21 @@ if __name__ == "__main__":
         action="store_true",
         help="With --events, print JSON object wrapper: {\"ok\": [...], \"problems\": [...]}",
     )
+    parser.add_argument(
+        "--full_report",
+        action="store_true",
+        help="Print original full nested report JSON",
+    )
     args = parser.parse_args()
 
     out = scan_folder(args.folder, recursive=args.recursive)
-    if args.events:
+    if args.full_report:
+        print(json.dumps(out, indent=2))
+        if args.pretty:
+            print(json.dumps(_renumber_event_ids(build_events(out)), indent=2, ensure_ascii=False))
+    else:
         events = _renumber_event_ids(build_events(out))
         if args.events_split:
             print(json.dumps(split_events(events), indent=2, ensure_ascii=False))
         else:
             print(json.dumps(events, indent=2, ensure_ascii=False))
-    else:
-        print(json.dumps(out, indent=2))
-        if args.pretty:
-            print(json.dumps(_renumber_event_ids(build_events(out)), indent=2, ensure_ascii=False))

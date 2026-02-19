@@ -110,6 +110,58 @@ def validate_firefighter_access(ifc_window, floor_elevation, floor_evacuation_he
     except Exception as e:
         return False, {"error": str(e)}
 
+
+def check_firefighter_access(model, floor_evacuation_height=None):
+    """
+    IFCore contract wrapper for firefighter access checks.
+
+    Signature: first arg `model` (ifcopenshell.file)
+    Returns: list[dict] matching element_results schema
+    """
+    results = []
+    for window in model.by_type("IfcWindow"):
+        container = ifcopenshell.util.element.get_container(window)
+        floor_z = (getattr(container, "Elevation", 0.0) / 1000.0) if container else 0.0
+        evac_h = floor_evacuation_height if floor_evacuation_height is not None else floor_z
+
+        overall, checks = validate_firefighter_access(
+            ifc_window=window,
+            floor_elevation=floor_z,
+            floor_evacuation_height=evac_h,
+        )
+
+        # Map overall status to contract values
+        if overall is True:
+            check_status = "pass"
+        elif overall is False:
+            check_status = "fail"
+        else:
+            check_status = "blocked"
+
+        # Build comment from failing checks
+        comment = None
+        if isinstance(checks, dict):
+            reasons = []
+            for k, v in checks.items():
+                if v.get("status") is False:
+                    reasons.append(f"{k}: {v.get('actual')}")
+            if reasons:
+                comment = "; ".join(reasons)
+
+        results.append({
+            "element_id": window.GlobalId,
+            "element_type": "IfcWindow",
+            "element_name": window.Name or f"Window {window.id()}",
+            "element_name_long": (window.Name if getattr(window, 'Name', None) else None),
+            "check_status": check_status,
+            "actual_value": ("Compliant" if overall is True else (comment or None)),
+            "required_value": "Width>=0.8m; Height>=1.2m; sill between -0.05m and 1.20m; no security bars if evac>9m",
+            "comment": comment,
+            "log": None,
+        })
+
+    return results
+
 # testing space
 
 if __name__ == "__main__":

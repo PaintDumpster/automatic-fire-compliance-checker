@@ -22,7 +22,7 @@ to validate building designs against Spanish fire safety regulations.
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routers import si1_router, si3_router, si4_router, si6_router
+from app.api.routers import si1_router, si3_router, si4_router, si5_router, si6_router
 
 # Create FastAPI application
 app = FastAPI(
@@ -57,6 +57,7 @@ def root():
             "si1": "/api/si1",
             "si3": "/api/si3",
             "si4": "/api/si4",
+            "si5": "/api/si5",
             "si6": "/api/si6"
         }
     }
@@ -74,4 +75,5 @@ def health_check():
 app.include_router(si1_router.router, prefix="/api/si1", tags=["SI-1 Interior Propagation"])
 app.include_router(si3_router.router, prefix="/api/si3", tags=["SI-3 Evacuation"])
 app.include_router(si4_router.router, prefix="/api/si4", tags=["SI-4 Protection Installations"])
+app.include_router(si5_router.router, prefix="/api/si5", tags=["SI-5 Firefighter Intervention"])
 app.include_router(si6_router.router, prefix="/api/si6", tags=["SI-6 Structural Resistance"])

@@ -28,7 +28,7 @@ import logging
 
 # Import the actual compliance function from utils/
 # This is the ONLY connection to your utility file
-from utils.si_6_fire_resistance_of_the_structure import check_si6_compliance
+from tools.si_6_fire_resistance_of_the_structure import check_si6_compliance
 
 # Create router
 router = APIRouter()

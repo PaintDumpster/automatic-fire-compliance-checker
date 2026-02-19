@@ -198,6 +198,81 @@ class SI4CheckResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# SI-5 FIREFIGHTER INTERVENTION MODELS
+# ─────────────────────────────────────────────
+
+class SI5CheckRequest(BaseModel):
+    """
+    Request to check firefighter intervention access (SI-5).
+    
+    Example:
+        {
+            "ifc_path": "/path/to/building.ifc"
+        }
+    """
+    ifc_path: str = Field(..., description="Absolute path to IFC file")
+
+
+class SI5CheckResponse(BaseModel):
+    """
+    Response from SI-5 firefighter intervention check.
+    
+    Contains:
+    - Summary of window compliance
+    - Total windows checked
+    - Compliant vs non-compliant counts
+    - Details for each window
+    """
+    summary_text: str = Field(..., description="Summary of compliance results")
+    total_checked: int = Field(..., description="Total windows checked")
+    total_compliant: int = Field(..., description="Number of compliant windows")
+    results: List[Dict[str, Any]] = Field(default_factory=list, description="Detailed results per window")
+    message: Optional[str] = None
+
+
+# ─────────────────────────────────────────────
+# SI-3 MAX ROUTE MODELS (Advanced Evacuation Routes)
+# ─────────────────────────────────────────────
+
+class SI3MaxRouteRequest(BaseModel):
+    """
+    Request to check maximum evacuation routes using grid-based pathfinding (SI-3 advanced).
+    
+    Example:
+        {
+            "ifc_path": "/path/to/building.ifc",
+            "typology": "Residencial Vivienda",
+            "has_auto_extinction": false,
+            "rules_json_path": "/path/to/regulation_rules.json"
+        }
+    """
+    ifc_path: str = Field(..., description="Absolute path to IFC file")
+    typology: Optional[str] = Field(default=None, description="Building typology (e.g., 'Residencial Vivienda')")
+    has_auto_extinction: bool = Field(default=False, description="Does building have automatic fire extinction system?")
+    rules_json_path: Optional[str] = Field(default=None, description="Path to regulation_rules.json")
+
+
+class SI3MaxRouteResponse(BaseModel):
+    """
+    Response from SI-3 maximum route check.
+    
+    Contains:
+    - Compliance status per space
+    - Maximum evacuation distance
+    - Worst-case spaces
+    - Route calculations using Dijkstra pathfinding
+    """
+    status: str = Field(..., description="Overall compliance: 'compliant', 'non_compliant', or 'partial'")
+    max_route_distance_m: float = Field(..., description="Maximum evacuation route found (meters)")
+    total_spaces: int
+    compliant_spaces: int
+    non_compliant_spaces: int
+    blocked_spaces: int
+    results: List[Dict[str, Any]] = Field(default_factory=list, description="Per-space compliance details")
+    message: Optional[str] = None
+
+
+# ─────────────────────────────────────────────
 # GENERIC ERROR RESPONSE
 # ─────────────────────────────────────────────
 

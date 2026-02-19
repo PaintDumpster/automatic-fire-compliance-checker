@@ -28,7 +28,7 @@ import logging
 
 # Import the actual compliance function from utils/
 # This is the ONLY connection to your utility file
-from utils.SI_4_installation_of_protection import check_si4_administrativo
+from tools.SI_4_installation_of_protection import check_si4_administrativo
 
 # Create router
 router = APIRouter()

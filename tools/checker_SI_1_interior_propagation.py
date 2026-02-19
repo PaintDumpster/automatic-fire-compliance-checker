@@ -1019,6 +1019,24 @@ def _build_events_sector_size(file_result: Dict[str, Any]) -> List[Dict[str, Any
     detail_messages = ((file_result.get("si1_sector_size") or {}).get("details") or {}).get("messages") or []
     has_sector_labels = bool((file_result.get("data_quality") or {}).get("has_sector_labels"))
 
+    if not checks:
+        rows.append(
+            to_row(
+                id=_make_event_id("SI1_SECTOR_SIZE", None, "SUMMARY", len(rows)),
+                check_result_id="SI1_SECTOR_SIZE",
+                element_id=None,
+                element_type="IfcZone" if has_sector_labels else "FireSector",
+                element_name="SUMMARY",
+                element_name_long=None,
+                check_status="blocked",
+                actual_value=None,
+                required_value=None,
+                comment="No sector checks were produced.",
+                log=" | ".join(str(m) for m in detail_messages) if detail_messages else None,
+            )
+        )
+        return rows
+
     for c in checks:
         sector_id = c.get("sector")
         if c.get("status") == "PASS":
@@ -1061,6 +1079,25 @@ def _build_events_special_risk_rooms(file_result: Dict[str, Any], rules: Dict[st
     rows: List[Dict[str, Any]] = []
     items = ((file_result.get("si1_special_risk_rooms") or {}).get("details") or {}).get("items") or []
     requirements_cfg = ((rules.get("special_risk_rooms") or {}).get("requirements") or {})
+
+    if not items:
+        rows.append(
+            to_row(
+                id=_make_event_id("SI1_SPECIAL_RISK_ROOM", None, "SUMMARY", len(rows)),
+                check_result_id="SI1_SPECIAL_RISK_ROOM",
+                element_id=None,
+                element_type="IfcSpace",
+                element_name="SUMMARY",
+                element_name_long=None,
+                check_status="pass",
+                actual_value="detected_count=0",
+                required_value=None,
+                comment="No special risk rooms detected.",
+                log=None,
+            )
+        )
+        return rows
+
     for it in items:
         guid = it.get("guid")
         dtype = it.get("detected_type")

@@ -1,3 +1,18 @@
+"""
+LEGACY FILE - NOT IFCORE PLATFORM COMPLIANT
+
+This file is kept for reference only. It does not follow IFCore platform contracts:
+- Functions take file paths instead of model objects
+- Return format is nested dicts, not list[dict]
+- Functions not named with check_* prefix
+
+For platform-compliant version, use:
+    tools/checker_si1_fire_compartmentation.py
+
+See documentation:
+    tools/SI1_FIRE_COMPARTMENTATION_CHECKER.md
+"""
+
 from __future__ import annotations
 
 import json

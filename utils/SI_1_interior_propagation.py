@@ -1052,15 +1052,28 @@ def _build_events_sector_size(file_result: Dict[str, Any]) -> List[Dict[str, Any
     return rows
 
 
-def _build_events_special_risk_rooms(file_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _build_events_special_risk_rooms(file_result: Dict[str, Any], rules: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Expected rules config shape:
+    # special_risk_rooms:
+    #   requirements:
+    #     kitchen: "DB-SI ... (your clause text here)"
+    #     laundry: "DB-SI ..."
     rows: List[Dict[str, Any]] = []
     items = ((file_result.get("si1_special_risk_rooms") or {}).get("details") or {}).get("items") or []
+    requirements_cfg = ((rules.get("special_risk_rooms") or {}).get("requirements") or {})
     for it in items:
         guid = it.get("guid")
         dtype = it.get("detected_type")
         kws = it.get("matched_keywords") or []
         kws_text = ", ".join(str(k) for k in kws) if kws else "none"
         zones = ", ".join(str(z) for z in (it.get("zones") or [])) if it.get("zones") else "none"
+        requirement = requirements_cfg.get(dtype)
+        if requirement is None:
+            required_value = "UNKNOWN (no requirement configured for this risk type)"
+            comment = "Special risk room detected, but requirement text is not configured in rules JSON."
+        else:
+            required_value = str(requirement)
+            comment = "Special risk room detected; manual DB-SI requirement confirmation is needed."
 
         rows.append(
             to_row(
@@ -1072,8 +1085,8 @@ def _build_events_special_risk_rooms(file_result: Dict[str, Any]) -> List[Dict[s
                 element_name_long=it.get("long_name"),
                 check_status="warning",
                 actual_value=f"type={dtype}; keywords=[{kws_text}]",
-                required_value="N/A",
-                comment="Special risk room detected; manual DB-SI requirement confirmation is needed.",
+                required_value=required_value,
+                comment=comment,
                 log=f"storey={it.get('storey')}; zones={zones}",
             )
         )
@@ -1172,6 +1185,7 @@ def _build_events_boundary_doors(file_result: Dict[str, Any]) -> List[Dict[str, 
 
 def build_events(out: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    rules = load_rules_config(str(DEFAULT_RULES_CONFIG_PATH))
     for result in out.get("results", []):
         if result.get("error"):
             rows.append(
@@ -1192,7 +1206,7 @@ def build_events(out: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
 
         rows.extend(_build_events_sector_size(result))
-        rows.extend(_build_events_special_risk_rooms(result))
+        rows.extend(_build_events_special_risk_rooms(result, rules))
         rows.extend(_build_events_boundary_doors(result))
     return rows
 

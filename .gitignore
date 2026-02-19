@@ -210,3 +210,6 @@ data_dp/
 00_data/
 data_PDF_LUISA/
 .claude/
+Data
+.conda
+app

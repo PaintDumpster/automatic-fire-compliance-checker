@@ -957,19 +957,6 @@ def is_si6_compliant(ifc_path, building_use, evacuation_height_m, is_basement=Fa
     )
 
 
-def check_si6_compliance(ifc_path, building_use, evacuation_height_m, is_basement=False):
-    """
-    Deprecated: Use get_si6_compliance_details() for full report or is_si6_compliant() for boolean.
-    
-    This function is kept for backward compatibility.
-    """
-    details = get_si6_compliance_details(ifc_path, building_use, evacuation_height_m, is_basement)
-    if "error" not in details:
-        details["overall_compliant"] = (
-            len(details["non_compliant"]) == 0 and
-            len(details["no_data"]) == 0
-        )
-    return details
 
 
 def export_check_results_to_json(results, output_path=None):
